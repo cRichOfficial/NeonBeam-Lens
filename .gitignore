@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Large model files — store in Git LFS or artifact registry instead
+models/*.hef
+models/*.onnx
+
+# Camera calibration data (large binary)
+calibration_data/*.npz
+calibration_data/*.pkl
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
