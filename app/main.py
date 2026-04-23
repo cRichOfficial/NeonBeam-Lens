@@ -1,8 +1,12 @@
+import asyncio
 import logging
 import sys
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from .services.mdns_advertiser import MdnsAdvertiser
 
 # Robust Debug Logging for Pi 5 NPU Analysis
 logging.basicConfig(
@@ -12,26 +16,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vision_api")
 
-app = FastAPI(title="NeonBeam Lens API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.debug("NeonBeam Lens starting up… Checking Hailo-8L NPU status…")
+
+    # Advertise on the LAN via mDNS so the Discovery Sidecar can find this
+    # service automatically.  Silently no-ops on Docker Desktop where multicast
+    # doesn't cross the NAT — the sidecar's subnet scan covers that case.
+    mdns = MdnsAdvertiser()
+    await asyncio.to_thread(mdns.start)
+
+    yield
+
+    logger.debug("NeonBeam Lens shutting down…")
+    await asyncio.to_thread(mdns.stop)
+
+
+app = FastAPI(title="NeonBeam Lens API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 class CalibrationRequest(BaseModel):
     reference_points: list
+
 
 class WorkloadTransformRequest(BaseModel):
     workpiece_id: str
     target_pos: dict
 
-@app.on_event("startup")
-async def startup_event():
-    logger.debug("Vision API starting up... Checking Hailo-8L NPU status...")
 
 @app.get("/api/health")
 async def health_check():

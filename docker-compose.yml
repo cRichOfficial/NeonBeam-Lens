@@ -1,0 +1,84 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  NeonBeam Lens — Standalone Docker Compose                                 ║
+# ║                                                                              ║
+# ║  Runs the machine vision FastAPI service on port 8001.                      ║
+# ║                                                                              ║
+# ║  Hardware targets:                                                           ║
+# ║    Development:  Any machine with a USB webcam (CPU OpenCV, no NPU)         ║
+# ║    Production:   Raspberry Pi 5 + Hailo-8L M.2 NPU Accelerator              ║
+# ║                                                                              ║
+# ║  Usage                                                                       ║
+# ║  ─────────────────────────────────────────────────────────────────────────  ║
+# ║    # Development (software fallback, USB webcam):                            ║
+# ║    docker compose up --build                                                 ║
+# ║                                                                              ║
+# ║    # Production (Pi 5 + Hailo-8L, detached):                                ║
+# ║    docker compose up -d --build                                              ║
+# ║    # then uncomment the 'devices' block and set VISION_CAMERA_ID below.     ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+services:
+  neonbeam-lens:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # ── Port exposure ─────────────────────────────────────────────────────────
+    # NeonBeam OS connects to this port for camera frames and vision results.
+    # Change the left-hand port if 8001 conflicts with another service.
+    ports:
+      - "8001:8001"
+
+    # ── Environment variables ─────────────────────────────────────────────────
+    # Copy .env.example → .env and adjust values before first run.
+    # Values in the 'environment' block below OVERRIDE anything in .env.
+    env_file:
+      - .env # created from .env.example — not committed to git
+
+    environment:
+
+      # ── Camera configuration ────────────────────────────────────────────────
+      #
+      # OpenCV camera index.  Run the following on the Pi to list cameras:
+      #   ls /dev/video*
+      #   v4l2-ctl --list-devices
+      #
+      #   0  → First available camera (USB webcam or Pi Camera in libcamera mode)
+      #   1  → Second camera (if two are attached)
+      VISION_CAMERA_ID: 0
+
+      # ── Logging ────────────────────────────────────────────────────────────
+      #
+      # VISION_DEBUG_LOGGING controls the log verbosity for the vision pipeline:
+      #   True   → DEBUG level: frame timings, inference scores, calibration matrices
+      #   False  → INFO level:  normal operation only
+      VISION_DEBUG_LOGGING: "True"
+
+    # ── Camera device pass-through ────────────────────────────────────────────
+    #
+    # Docker does not expose camera devices by default.  Uncomment and adjust
+    # the 'devices' block for your hardware configuration.
+    #
+    # USB webcam (most development machines and Pi with USB camera):
+    #   /dev/video0:/dev/video0
+    #
+    # Raspberry Pi Camera Module (via libcamera — exposes as /dev/video0):
+    #   May also require /dev/media0 and /dev/media1 for full libcamera control.
+    #   Use the 'privileged' mode below as an alternative.
+    #
+    # Hailo-8L NPU (Raspberry Pi 5 + M.2 HAT+):
+    #   /dev/hailo0:/dev/hailo0
+    #
+    # devices:
+    #   - /dev/video0:/dev/video0   # Camera — USB webcam or Pi Camera
+    #   - /dev/hailo0:/dev/hailo0   # Hailo-8L NPU (Pi 5 only)
+    #
+    # ── Privileged mode (alternative to per-device listing) ──────────────────
+    # Grants the container access to ALL host devices.  Use this on the Pi if
+    # libcamera requires access to multiple /dev/media* nodes that are difficult
+    # to enumerate individually.  Not recommended for security-hardened deploys.
+    #
+    # privileged: true
+
+    # ── Restart policy ────────────────────────────────────────────────────────
+    restart: unless-stopped
