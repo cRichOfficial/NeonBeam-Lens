@@ -52,9 +52,9 @@ services:
 
     # ── Hardware Pass-through ────────────────────────────────────────────────
     # Uncomment the following on the Pi 5 to grant access to the Camera and NPU.
-    # devices:
-    #   - /dev/video0:/dev/video0   # Camera
-    #   - /dev/hailo0:/dev/hailo0   # Hailo-8L NPU
+    devices:
+      - /dev/video0:/dev/video0   # Camera
+      - /dev/hailo0:/dev/hailo0   # Hailo-8L NPU
     
     # If using libcamera on Pi, you might need privileged mode for media nodes:
     # privileged: true
