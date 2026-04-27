@@ -29,7 +29,7 @@ NeonBeam Lens is a Python FastAPI service designed for the **Raspberry Pi 5** (w
 
 ## API Endpoints
 
-### 1. Calibration
+### 1. AprilTag Generation & Calibration
 - **`GET /api/apriltag/generate/{tag_id}`**: Returns a printable AprilTag (Tag36h11).
 - **`POST /api/lens/calibrate`**: Calibrates the camera using detected tags and physical mm coordinates.
   ```json

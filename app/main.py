@@ -82,10 +82,24 @@ async def health_check():
     }
 
 @app.get("/api/apriltag/generate/{tag_id}")
-async def generate_tag(tag_id: int, size_px: int = 400):
-    tag_img = AprilTagGenerator.generate(tag_id, size_px)
-    _, buffer = cv2.imencode('.png', tag_img)
-    return Response(content=buffer.tobytes(), media_type="image/png")
+async def generate_tag(tag_id: int, size_mm: float = 50.0, dpi: int = 300):
+    """Generate a single tag with physical sizing metadata."""
+    tag_bytes = AprilTagGenerator.generate(tag_id, size_mm, dpi)
+    return Response(content=tag_bytes, media_type="image/png")
+
+@app.get("/api/apriltag/batch")
+async def batch_generate_tags(start_id: int = 0, count: int = 4, size_mm: float = 50.0, dpi: int = 300):
+    """Return a list of tags with download links and DPI info."""
+    tags = []
+    for i in range(count):
+        tag_id = start_id + i
+        tags.append({
+            "id": tag_id,
+            "size_mm": size_mm,
+            "dpi": dpi,
+            "download_url": f"/api/apriltag/generate/{tag_id}?size_mm={size_mm}&dpi={dpi}"
+        })
+    return {"status": "ok", "tags": tags}
 
 @app.post("/api/lens/calibrate")
 async def calibrate(request: CalibrationRequest):

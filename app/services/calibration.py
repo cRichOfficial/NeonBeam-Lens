@@ -3,6 +3,8 @@ import numpy as np
 import json
 import os
 import logging
+import io
+from PIL import Image
 from typing import List, Dict, Optional, Tuple
 
 logger = logging.getLogger("vision_api.calibration")
@@ -127,11 +129,33 @@ class CalibrationService:
 
 class AprilTagGenerator:
     @staticmethod
-    def generate(tag_id: int, size_px: int = 400) -> np.ndarray:
-        """Generate an AprilTag image."""
+    def generate(tag_id: int, size_mm: float = 50.0, dpi: int = 300) -> bytes:
+        """
+        Generate an AprilTag image with embedded DPI metadata for scaling.
+        Returns bytes of a PNG image.
+        """
+        # Calculate pixel size based on mm and DPI
+        # 1 inch = 25.4 mm
+        size_px = int((size_mm / 25.4) * dpi)
+        
+        # AprilTags have a border, so we generate the marker slightly smaller 
+        # or just use the full size_px for the marker itself.
         aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         tag_img = cv2.aruco.generateImageMarker(aruco_dict, tag_id, size_px)
-        return tag_img
+        
+        # Convert to PIL Image to set DPI metadata
+        pil_img = Image.fromarray(tag_img)
+        
+        # Add a white border (standard for AprilTags to ensure detection)
+        border_px = size_px // 10
+        total_size = size_px + 2 * border_px
+        final_img = Image.new("L", (total_size, total_size), 255)
+        final_img.paste(pil_img, (border_px, border_px))
+        
+        # Save to buffer with DPI
+        buf = io.BytesIO()
+        final_img.save(buf, format="PNG", dpi=(dpi, dpi))
+        return buf.getvalue()
 
 # Global instance
 calibration_service = CalibrationService()
