@@ -34,7 +34,12 @@ class CameraService:
         if self.running:
             return
         
-        self.cap = cv2.VideoCapture(self.camera_id)
+        # Explicitly use V4L2 backend for Linux/Pi 5 compatibility
+        self.cap = cv2.VideoCapture(self.camera_id, cv2.CAP_V4L2)
+        if not self.cap.isOpened():
+            logger.warning(f"Failed to open camera {self.camera_id} via V4L2, trying default...")
+            self.cap = cv2.VideoCapture(self.camera_id)
+            
         if not self.cap.isOpened():
             logger.error(f"Failed to open camera {self.camera_id}")
             return False
