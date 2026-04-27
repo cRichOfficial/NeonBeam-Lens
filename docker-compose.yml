@@ -22,63 +22,39 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: neonbeam-lens
+    restart: unless-stopped
 
-    # ── Port exposure ─────────────────────────────────────────────────────────
-    # NeonBeam OS connects to this port for camera frames and vision results.
-    # Change the left-hand port if 8001 conflicts with another service.
+    # ── Network & Port Exposure ──────────────────────────────────────────────
+    # For mDNS discovery to work on the Raspberry Pi (Linux), network_mode: host
+    # is required so multicast traffic reaches the LAN.
+    # Note: When using host mode, 'ports' mapping is ignored as the container
+    # uses the host's IP and the service port (8001).
+    #
+    # network_mode: host  # Recommended for Raspberry Pi / Production
+
     ports:
       - "8001:8001"
 
-    # ── Environment variables ─────────────────────────────────────────────────
-    # Copy .env.example → .env and adjust values before first run.
-    # Values in the 'environment' block below OVERRIDE anything in .env.
+    # ── Persistence ──────────────────────────────────────────────────────────
+    # Persist calibration data so it survives container restarts.
+    volumes:
+      - ./calibration_data:/app/calibration_data
+      - ./models:/app/models
+
+    # ── Environment Configuration ────────────────────────────────────────────
     env_file:
-      - .env # created from .env.example — not committed to git
-
+      - .env
     environment:
+      - VISION_CAMERA_ID=0
+      - VISION_DEBUG_LOGGING=True
+      - USE_HAILO=False  # Set to True on Pi 5 with AI Kit
 
-      # ── Camera configuration ────────────────────────────────────────────────
-      #
-      # OpenCV camera index.  Run the following on the Pi to list cameras:
-      #   ls /dev/video*
-      #   v4l2-ctl --list-devices
-      #
-      #   0  → First available camera (USB webcam or Pi Camera in libcamera mode)
-      #   1  → Second camera (if two are attached)
-      VISION_CAMERA_ID: 0
-
-      # ── Logging ────────────────────────────────────────────────────────────
-      #
-      # VISION_DEBUG_LOGGING controls the log verbosity for the vision pipeline:
-      #   True   → DEBUG level: frame timings, inference scores, calibration matrices
-      #   False  → INFO level:  normal operation only
-      VISION_DEBUG_LOGGING: "True"
-
-    # ── Camera device pass-through ────────────────────────────────────────────
-    #
-    # Docker does not expose camera devices by default.  Uncomment and adjust
-    # the 'devices' block for your hardware configuration.
-    #
-    # USB webcam (most development machines and Pi with USB camera):
-    #   /dev/video0:/dev/video0
-    #
-    # Raspberry Pi Camera Module (via libcamera — exposes as /dev/video0):
-    #   May also require /dev/media0 and /dev/media1 for full libcamera control.
-    #   Use the 'privileged' mode below as an alternative.
-    #
-    # Hailo-8L NPU (Raspberry Pi 5 + M.2 HAT+):
-    #   /dev/hailo0:/dev/hailo0
-    #
+    # ── Hardware Pass-through ────────────────────────────────────────────────
+    # Uncomment the following on the Pi 5 to grant access to the Camera and NPU.
     # devices:
-    #   - /dev/video0:/dev/video0   # Camera — USB webcam or Pi Camera
-    #   - /dev/hailo0:/dev/hailo0   # Hailo-8L NPU (Pi 5 only)
-    #
-    # ── Privileged mode (alternative to per-device listing) ──────────────────
-    # Grants the container access to ALL host devices.  Use this on the Pi if
-    # libcamera requires access to multiple /dev/media* nodes that are difficult
-    # to enumerate individually.  Not recommended for security-hardened deploys.
-    #
+    #   - /dev/video0:/dev/video0   # Camera
+    #   - /dev/hailo0:/dev/hailo0   # Hailo-8L NPU
+    
+    # If using libcamera on Pi, you might need privileged mode for media nodes:
     # privileged: true
-
-    # ── Restart policy ────────────────────────────────────────────────────────
-    restart: unless-stopped
