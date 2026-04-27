@@ -17,9 +17,13 @@ export VISION_PORT=${VISION_PORT:-8001}
 
 # Raspberry Pi 5 libcamera compatibility layer
 # This allows OpenCV to access the CSI camera via V4L2
-V4L2_WRAPPER="/usr/lib/aarch64-linux-gnu/libcamerav4l2.so"
+V4L2_WRAPPER="/usr/libexec/aarch64-linux-gnu/libcamera/v4l2-compat.so"
+if [ ! -f "$V4L2_WRAPPER" ]; then
+    V4L2_WRAPPER="/usr/lib/aarch64-linux-gnu/libcamerav4l2.so"
+fi
+
 if [ -f "$V4L2_WRAPPER" ]; then
-    echo "Found Pi 5 V4L2 wrapper, preloading..."
+    echo "Found Pi 5 V4L2 wrapper at $V4L2_WRAPPER, preloading..."
     export LD_PRELOAD="$V4L2_WRAPPER"
 fi
 
