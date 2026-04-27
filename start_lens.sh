@@ -25,6 +25,10 @@ fi
 if [ -f "$V4L2_WRAPPER" ]; then
     echo "Found Pi 5 V4L2 wrapper at $V4L2_WRAPPER, preloading..."
     export LD_PRELOAD="$V4L2_WRAPPER"
+    
+    # Prime the hardware for 1280x720 YUYV
+    echo "Priming camera hardware..."
+    v4l2-ctl -d "/dev/video$VISION_CAMERA_ID" --set-fmt-video=width=1280,height=720,pixelformat=YUYV || true
 fi
 
 echo "Starting NeonBeam Lens on port $VISION_PORT (USE_HAILO=$USE_HAILO)..."
