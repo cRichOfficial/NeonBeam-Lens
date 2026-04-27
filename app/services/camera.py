@@ -60,14 +60,37 @@ class CameraService:
         logger.info("Camera capture thread stopped")
 
     def _capture_loop(self):
+        # Optional: Set properties for better compatibility on Pi 5
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        # Using YUYV as it's the primary format supported by /dev/video0 on Pi 5
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+
+        width = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        height = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        logger.info(f"Camera opened: {width}x{height} @ {fps} FPS")
+
+        fail_count = 0
         while self.running:
             ret, frame = self.cap.read()
-            if ret:
+            if ret and frame is not None:
                 self.last_frame = frame
+                fail_count = 0
             else:
-                logger.warning("Failed to capture frame")
+                fail_count += 1
+                if fail_count % 30 == 0: # Log every ~3 seconds
+                    logger.warning(f"Failed to capture frame (consecutive failures: {fail_count})")
+                
+                if fail_count > 100:
+                    logger.error("Too many capture failures. Restarting camera...")
+                    self.cap.release()
+                    time.sleep(1.0)
+                    self.cap = cv2.VideoCapture(self.camera_id, cv2.CAP_V4L2)
+                    fail_count = 0
+                
                 time.sleep(0.1)
-            time.sleep(0.01)  # Limit CPU usage
+            time.sleep(0.01)
 
     def get_frame(self):
         """Return the most recent frame."""
