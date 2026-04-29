@@ -127,18 +127,23 @@ def _decode_yolov8_seg(outputs: Dict[str, np.ndarray], orig_h: int, orig_w: int,
 
         boxes = np.stack([x1, y1, x2, y2], axis=-1)
 
+        logger.info(f"Scale {grid_size}x{grid_size}: {len(scores)} anchors passed confidence > {conf_threshold}")
+
         all_boxes.append(boxes)
         all_scores.append(scores)
         all_class_ids.append(class_ids)
         all_mask_coeffs.append(mask_coeffs)
 
     if not all_boxes:
+        logger.warning("No anchors passed confidence threshold across all scales.")
         return []
 
     boxes = np.concatenate(all_boxes, axis=0)
     scores = np.concatenate(all_scores, axis=0)
     class_ids = np.concatenate(all_class_ids, axis=0)
     mask_coeffs = np.concatenate(all_mask_coeffs, axis=0)
+    
+    logger.info(f"Total raw detections before NMS: {len(boxes)}")
 
     # Scale to original image
     scale_x = orig_w / model_size
@@ -149,6 +154,8 @@ def _decode_yolov8_seg(outputs: Dict[str, np.ndarray], orig_h: int, orig_w: int,
 
     # NMS
     kept = _nms(boxes, scores, iou_threshold)
+    logger.info(f"Total detections after NMS: {len(kept)}")
+    
     results = []
 
     for idx in kept:
