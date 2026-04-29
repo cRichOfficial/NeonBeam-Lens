@@ -9,8 +9,6 @@ cd "$DIR"
 if [ -d ".venv" ]; then
     source .venv/bin/activate
 fi
-# Add Debian dist-packages to PYTHONPATH (fixes --system-site-packages quirk on Trixie)
-export PYTHONPATH="/usr/lib/python3/dist-packages:$PYTHONPATH"
 
 # Set default environment variables if not already set
 export USE_HAILO=${USE_HAILO:-True}
