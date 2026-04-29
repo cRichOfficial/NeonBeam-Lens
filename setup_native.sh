@@ -7,10 +7,9 @@ set -e
 echo "--- NeonBeam Lens Native Setup ---"
 
 # 1. Update system and install dependencies
-echo "[1/4] Installing system dependencies..."
+echo "[1/5] Installing basic system dependencies..."
 sudo apt-get update
 sudo apt-get install -y \
-    python3-venv \
     python3-pip \
     libgl1 \
     libglib2.0-0 \
@@ -21,13 +20,44 @@ sudo apt-get install -y \
     v4l-utils \
     python3-hailort
 
-# 2. Create virtual environment
-echo "[2/5] Creating virtual environment (.venv)..."
-if [ ! -d ".venv" ]; then
-    python3 -m venv .venv --system-site-packages
-    echo "Created .venv (using system-site-packages for Hailo access)."
+# Auto-detect which Python version Hailo is actually compiled for
+echo "Detecting Hailo Python binding version..."
+HAILO_SO=$(find /usr/lib/python3/dist-packages /usr/lib/python3.* -name "_hailort*.so" 2>/dev/null | head -n 1)
+
+if [ -z "$HAILO_SO" ]; then
+    echo "WARNING: Could not find compiled Hailo Python bindings. Using default python3."
+    TARGET_PY="python3"
 else
-    echo ".venv already exists."
+    # Extract version (e.g. 311 from _hailort.cpython-311-aarch64-linux-gnu.so)
+    VER_STR=$(echo "$HAILO_SO" | grep -oP 'cpython-\K\d+')
+    if [ -n "$VER_STR" ]; then
+        TARGET_PY="python${VER_STR:0:1}.${VER_STR:1}"
+        echo "Found Hailo bindings for $TARGET_PY ($HAILO_SO)"
+    else
+        TARGET_PY="python3"
+    fi
+fi
+
+echo "Installing $TARGET_PY virtual environment packages..."
+sudo apt-get install -y $TARGET_PY ${TARGET_PY}-venv ${TARGET_PY}-dev
+
+# 2. Create virtual environment
+echo "[2/5] Creating virtual environment (.venv) using $TARGET_PY..."
+
+if [ -d ".venv" ]; then
+    # Ensure existing venv matches the target python
+    VENV_PY=$(.venv/bin/python --version 2>&1)
+    if [[ "$VENV_PY" != *"${TARGET_PY#python}"* ]]; then
+        echo "Existing .venv is not $TARGET_PY ($VENV_PY). Rebuilding..."
+        rm -rf .venv
+    fi
+fi
+
+if [ ! -d ".venv" ]; then
+    $TARGET_PY -m venv .venv --system-site-packages
+    echo "Created .venv with $TARGET_PY and --system-site-packages."
+else
+    echo ".venv already exists and matches $TARGET_PY."
 fi
 
 # 3. Install Python dependencies
