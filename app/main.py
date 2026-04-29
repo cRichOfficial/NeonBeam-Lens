@@ -89,21 +89,6 @@ async def generate_tag(tag_id: int, size_mm: float = 50.0, dpi: int = 300):
 
 @app.get("/api/apriltag/batch")
 async def batch_generate_tags(start_id: int = 0, count: int = 4, size_mm: float = 50.0, dpi: int = 300, paper_width_in: float = 8.5, paper_height_in: float = 11.0):
-    """Return a list of tags with download links and DPI info."""
-    tags = []
-    for i in range(count):
-        tag_id = start_id + i
-        tags.append({
-            "id": tag_id,
-            "size_mm": size_mm,
-            "dpi": dpi,
-            "download_url": f"/api/apriltag/generate/{tag_id}?size_mm={size_mm}&dpi={dpi}"
-        })
-    document_url = f"/api/apriltag/batch/document?start_id={start_id}&count={count}&size_mm={size_mm}&dpi={dpi}&paper_width_in={paper_width_in}&paper_height_in={paper_height_in}"
-    return {"status": "ok", "document_url": document_url, "tags": tags}
-
-@app.get("/api/apriltag/batch/document")
-async def batch_generate_document(start_id: int = 0, count: int = 4, size_mm: float = 50.0, dpi: int = 300, paper_width_in: float = 8.5, paper_height_in: float = 11.0):
     """Return a multi-page PDF containing all requested tags packed for standard printing."""
     pdf_bytes = AprilTagGenerator.generate_batch_document(start_id, count, size_mm, dpi, paper_width_in, paper_height_in)
     return Response(content=pdf_bytes, media_type="application/pdf")

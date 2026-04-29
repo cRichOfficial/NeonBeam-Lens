@@ -179,11 +179,12 @@ class AprilTagGenerator:
         sample_tag = AprilTagGenerator.generate(start_id, size_mm, dpi, return_pil=True)
         tag_w, tag_h = sample_tag.size
         
-        # Add padding between tags and page edges
-        padding_px = int(0.25 * dpi) # 0.25 inch margin
+        # Add padding between tags and page edges (10mm margin to prevent printer clipping)
+        margin_mm = 10.0
+        margin_px = int((margin_mm / 25.4) * dpi)
         
-        usable_w = paper_w_px - 2 * padding_px
-        usable_h = paper_h_px - 2 * padding_px
+        usable_w = paper_w_px - 2 * margin_px
+        usable_h = paper_h_px - 2 * margin_px
         
         cols = max(1, usable_w // tag_w)
         rows = max(1, usable_h // tag_h)
@@ -208,8 +209,8 @@ class AprilTagGenerator:
             row = idx_on_page // cols
             col = idx_on_page % cols
             
-            x = padding_px + col * tag_w
-            y = padding_px + row * tag_h
+            x = margin_px + col * tag_w
+            y = margin_px + row * tag_h
             
             current_page.paste(tag_img, (x, y))
             
