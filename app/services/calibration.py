@@ -4,6 +4,7 @@ import json
 import os
 import logging
 import io
+import base64
 from PIL import Image, ImageDraw
 from typing import List, Dict, Optional, Tuple, Union
 
@@ -53,8 +54,11 @@ class CalibrationService:
             logger.error(f"Failed to save calibration: {e}")
 
     def detect_tags(self, image: np.ndarray) -> List[Dict]:
-        """Detect AprilTags in the image."""
-        corners, ids, rejected = self.detector.detectMarkers(image)
+        """Detect AprilTags in the image. Automatically undistorts if enabled."""
+        # Ensure we are working with an undistorted image for tag detection
+        img_processed = self.undistort(image)
+        
+        corners, ids, rejected = self.detector.detectMarkers(img_processed)
         results = []
         if ids is not None:
             for i, tag_id in enumerate(ids.flatten()):
@@ -231,15 +235,24 @@ class CalibrationService:
         phys_map = {p["id"]: p for p in self.calibration_data.get("physical_data", [])}
 
         per_tag_errors = []
+        debug_img = self.undistort(image).copy()
+
         for tag in detected:
             tid = tag["id"]
+            corners = np.array(tag["corners"])
+            center_px = corners.mean(axis=0).astype(np.int32)
+            
+            # Draw on debug image
+            cv2.polylines(debug_img, [corners.astype(np.int32)], True, (0, 255, 0), 2)
+            cv2.putText(debug_img, f"ID:{tid}", (center_px[0], center_px[1]), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
             if tid not in phys_map:
                 continue
 
             p = phys_map[tid]
-            corners = np.array(tag["corners"])
-            center_px = corners.mean(axis=0).reshape(1, 2).astype(np.float32)
-            center_mm = self.map_pixels_to_mm(center_px)[0]
+            center_px_f = corners.mean(axis=0).reshape(1, 2).astype(np.float32)
+            center_mm = self.map_pixels_to_mm(center_px_f)[0]
 
             expected_mm = np.array([p["x"], p["y"]], dtype=np.float32)
             error_mm = float(np.linalg.norm(center_mm - expected_mm))
@@ -262,11 +275,19 @@ class CalibrationService:
         mean_error = round(float(np.mean([t["error_mm"] for t in per_tag_errors])), 2)
         quality = "good" if mean_error < 5.0 else "poor"
 
+        # Save debug image to disk and encode to Base64 for the API
+        debug_path = os.path.join(os.path.dirname(self.data_path), "calibration_debug.jpg")
+        cv2.imwrite(debug_path, debug_img)
+        
+        _, buffer = cv2.imencode('.jpg', debug_img)
+        img_b64 = base64.b64encode(buffer).decode('utf-8')
+
         return {
             "status": "calibrated",
             "quality": quality,
             "mean_error_mm": mean_error,
             "per_tag_errors": per_tag_errors,
+            "debug_image_b64": img_b64
         }
 
 class AprilTagGenerator:
