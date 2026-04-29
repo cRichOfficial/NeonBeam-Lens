@@ -69,21 +69,20 @@ mkdir -p calibration_data app/models
 # 5. Symlink the Hailo segmentation model installed by hailo-all
 echo "[5/5] Linking Hailo segmentation model..."
 HEF_PATH="/usr/share/hailo-models/yolov8s_seg.hef"
+LOCAL_HEF="app/models/yolov8s_seg.hef"
 
-if [ ! -f "$HEF_PATH" ]; then
-    echo ""
-    echo "  WARNING: $HEF_PATH not found."
-    echo "  The yolov8s_seg model should be installed as part of 'hailo-all'."
-    echo "  Ensure you have run: sudo apt install hailo-all"
-    echo "  Then re-run this script."
-    echo ""
-else
-    if [ ! -e "app/models/yolov8s_seg.hef" ]; then
-        ln -s "$HEF_PATH" app/models/yolov8s_seg.hef
-        echo "  Symlinked $HEF_PATH -> app/models/yolov8s_seg.hef"
+if [ -f "$HEF_PATH" ]; then
+    if [ ! -e "$LOCAL_HEF" ]; then
+        ln -s "$HEF_PATH" "$LOCAL_HEF"
+        echo "  Symlinked $HEF_PATH -> $LOCAL_HEF"
     else
-        echo "  app/models/yolov8s_seg.hef already linked, skipping."
+        echo "  $LOCAL_HEF already exists, skipping."
     fi
+else
+    echo "  $HEF_PATH not found. The hailo-models package does not include the segmentation model."
+    echo "  Downloading yolov8s_seg.hef directly from Hailo Model Zoo..."
+    wget -qO "$LOCAL_HEF" "https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.11.0/hailo8l/yolov8s_seg.hef"
+    echo "  Downloaded successfully to $LOCAL_HEF"
 fi
 
 # Make start script executable
