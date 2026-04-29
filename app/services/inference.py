@@ -165,6 +165,10 @@ class InferenceService:
 
     def _init_hailo(self):
         """Initialize Hailo-8L NPU via hailort Python API."""
+        import sys
+        if "/usr/lib/python3/dist-packages" not in sys.path:
+            sys.path.append("/usr/lib/python3/dist-packages")
+
         try:
             import hailort
             logger.info(f"Loading Hailo HEF from {self.model_path}")
@@ -198,6 +202,9 @@ class InferenceService:
 
     def _run_hailo_inference(self, image: np.ndarray) -> List[Dict]:
         """Run YOLOv8-seg on the Hailo NPU and return raw pre-mapped detections."""
+        import sys
+        if "/usr/lib/python3/dist-packages" not in sys.path:
+            sys.path.append("/usr/lib/python3/dist-packages")
         import hailort
 
         orig_h, orig_w = image.shape[:2]
