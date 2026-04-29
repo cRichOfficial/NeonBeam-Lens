@@ -31,6 +31,29 @@ class CalibrationService:
         # AprilTag setup (using Aruco module)
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         self.aruco_params = cv2.aruco.DetectorParameters()
+
+        # ── Tuning for small tags at high resolution ──────────────────────────
+        # Default minMarkerPerimeterRate=0.03 requires perimeter >= 3% of image
+        # longest side. At 4608px that's ~138px — a 20mm tag in a fisheye corner
+        # can easily be smaller. Lower to 0.005 (~23px min perimeter).
+        self.aruco_params.minMarkerPerimeterRate = 0.005
+        self.aruco_params.maxMarkerPerimeterRate = 4.0
+
+        # Widen the adaptive threshold window range so small tags at the
+        # dark/bright boundary of the fisheye edge are still binarized cleanly.
+        self.aruco_params.adaptiveThreshWinSizeMin = 3
+        self.aruco_params.adaptiveThreshWinSizeMax = 53
+        self.aruco_params.adaptiveThreshWinSizeStep = 4
+
+        # Allow slightly more error in corner refinement for small/distorted tags
+        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.aruco_params.cornerRefinementMaxIterations = 50
+        self.aruco_params.cornerRefinementMinAccuracy = 0.05
+
+        # Allow a larger perspective distortion — important for fisheye corners
+        self.aruco_params.perspectiveRemovePixelPerCell = 4
+        self.aruco_params.perspectiveRemoveIgnoredMarginPerCell = 0.13
+
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
     def load_calibration(self):
