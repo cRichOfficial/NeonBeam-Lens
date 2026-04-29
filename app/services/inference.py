@@ -195,6 +195,9 @@ class InferenceService:
         self.min_area_mm2 = float(os.getenv("MIN_WORKPIECE_AREA_MM2", "500"))
         self.max_area_mm2 = float(os.getenv("MAX_WORKPIECE_AREA_MM2", "160000"))
         self.honeycomb_kernel = int(os.getenv("HONEYCOMB_KERNEL_SIZE", "25"))
+        # Extra pixels to expand the AprilTag mask beyond the tag boundary,
+        # to cover the white paper backing the tag is printed on.
+        self.apriltag_mask_padding = int(os.getenv("APRILTAG_MASK_PADDING", "30"))
         self.model_input_size = 640
 
         self.vdevice = None
@@ -335,15 +338,22 @@ class InferenceService:
             
         thresh = cv2.bitwise_and(thresh, mask_roi)
 
-        # 5. Specifically mask out the tags themselves so they aren't detected as objects
+        # 5. Mask out the tags AND their surrounding white paper backing.
+        # We expand each tag polygon outward from its centroid by apriltag_mask_padding
+        # pixels so the white paper square they're printed on is also excluded.
+        pad = self.apriltag_mask_padding
         for tag in tags:
-            pts = np.array(tag['corners'], dtype=np.int32)
-            cv2.fillPoly(thresh, [pts], 0)
+            corners = np.array(tag['corners'], dtype=np.float32)
+            centroid = corners.mean(axis=0)
+            # Scale each corner outward from the centroid
+            expanded = centroid + (corners - centroid) * (1.0 + pad / max(
+                np.linalg.norm(corners - centroid, axis=1).max(), 1.0
+            ))
+            cv2.fillPoly(thresh, [expanded.astype(np.int32)], 0)
 
-        # 6. Heavy Morphological Closing to "glue" fragments into solid coasters
-        # We use a 35px kernel to bridge the dark gaps between engravings
-        kernel_size = max(self.honeycomb_kernel, 35)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+        # 6. Morphological Closing to bridge gaps within workpieces.
+        # Tune HONEYCOMB_KERNEL_SIZE in .env (smaller = tighter bounding boxes).
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (self.honeycomb_kernel, self.honeycomb_kernel))
         closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
         dilated = cv2.dilate(closed, kernel, iterations=1)
 
