@@ -3,10 +3,11 @@ import logging
 import sys
 import io
 import cv2
+import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
@@ -96,6 +97,14 @@ async def batch_generate_tags(start_id: int = 0, count: int = 4, size_mm: float 
     """Return a multi-page PDF containing all requested tags packed for standard printing."""
     pdf_bytes = AprilTagGenerator.generate_batch_document(start_id, count, size_mm, dpi, paper_width_in, paper_height_in)
     return Response(content=pdf_bytes, media_type="application/pdf")
+
+@app.get("/api/lens/calibration/debug-image")
+async def get_calibration_debug_image():
+    """Returns the visual debug image from the last calibration check."""
+    debug_path = "calibration_data/calibration_debug.jpg"
+    if not os.path.exists(debug_path):
+        raise HTTPException(status_code=404, detail="Debug image not found. Run /api/lens/calibration/check first.")
+    return FileResponse(debug_path, media_type="image/jpeg")
 
 @app.post("/api/lens/calibrate")
 async def calibrate(request: CalibrationRequest):

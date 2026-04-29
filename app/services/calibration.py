@@ -275,19 +275,16 @@ class CalibrationService:
         mean_error = round(float(np.mean([t["error_mm"] for t in per_tag_errors])), 2)
         quality = "good" if mean_error < 5.0 else "poor"
 
-        # Save debug image to disk and encode to Base64 for the API
+        # Save debug image to disk
         debug_path = os.path.join(os.path.dirname(self.data_path), "calibration_debug.jpg")
         cv2.imwrite(debug_path, debug_img)
         
-        _, buffer = cv2.imencode('.jpg', debug_img)
-        img_b64 = base64.b64encode(buffer).decode('utf-8')
-
         return {
             "status": "calibrated",
             "quality": quality,
             "mean_error_mm": mean_error,
             "per_tag_errors": per_tag_errors,
-            "debug_image_b64": img_b64
+            "debug_image_url": "/api/lens/calibration/debug-image"
         }
 
 class AprilTagGenerator:
