@@ -309,63 +309,105 @@ class AprilTagGenerator:
     @staticmethod
     def generate(tag_id: int, size_mm: float = 50.0, dpi: int = 300, return_pil: bool = False) -> Union[bytes, Image.Image]:
         """
-        Generate an AprilTag image with embedded DPI metadata for scaling.
-        Returns bytes of a PDF/PNG image or a PIL Image object.
+        Generate an AprilTag image with a cut-guide border and a labeled footer.
+
+        Layout (all measurements in "units", where 1 unit = size_px // 10):
+        ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐  ← cut-guide border (thin line)
+          ┌───────────────────────┐
+          │                       │      1-unit white gap on top and sides
+          │   [  AprilTag  ]      │
+          │                       │
+          ├───────────────────────┤      bottom of tag
+          │    ID: 0              │      text row (smaller, ~3mm)
+          │                       │      1-unit gap below text
+        └ └───────────────────────┘ ┘  ← cut-guide border + footer bottom border
+          ↑                       ↑
+          side borders extend through footer
         """
-        # Calculate pixel size based on mm and DPI
-        # 1 inch = 25.4 mm
+        # Core pixel size of the tag itself
         size_px = int((size_mm / 25.4) * dpi)
-        
+
+        # 1 "unit" = 10% of the tag size — used for all spacing
+        unit = max(4, size_px // 10)
+
         aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         tag_img = cv2.aruco.generateImageMarker(aruco_dict, tag_id, size_px)
-        
         tag_img_rgb = cv2.cvtColor(tag_img, cv2.COLOR_GRAY2RGB)
-        
-        # Define margins (use size_px // 5 to give a solid 2-module white safe zone)
-        top_margin = size_px // 5
-        side_margin = size_px // 5
-        
-        # Calculate text size and bottom margin
+
+        # ── Text sizing ──────────────────────────────────────────────────────
         text = f"ID: {tag_id}"
         font = cv2.FONT_HERSHEY_SIMPLEX
-        
-        target_text_h_px = max(10, int((5.0 / 25.4) * dpi)) # 5mm height for text
-        
+        border_thickness = max(1, unit // 8)
+
+        # Target text height ~3mm (smaller than before)
+        target_text_h_px = max(8, int((3.0 / 25.4) * dpi))
         font_scale = 1.0
-        thickness = max(1, int(target_text_h_px / 20))
-        (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-        font_scale = target_text_h_px / float(text_h)
-        (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-        
-        bottom_margin = top_margin + text_h + baseline + int((5.0 / 25.4) * dpi) # space for text + 5mm padding
-        
-        total_w = size_px + 2 * side_margin
-        total_h = size_px + top_margin + bottom_margin
-        
-        # Create canvas
+        text_thickness = max(1, int(target_text_h_px / 22))
+        (tw, th), baseline = cv2.getTextSize(text, font, font_scale, text_thickness)
+        font_scale = target_text_h_px / float(th)
+        (tw, th), baseline = cv2.getTextSize(text, font, font_scale, text_thickness)
+
+        # ── Canvas dimensions ────────────────────────────────────────────────
+        # Top: 1 unit gap above tag
+        # Bottom: 1 unit gap (tag→text) + text height + baseline + 1 unit gap (text→border)
+        top_gap    = unit
+        text_row_h = th + baseline + unit   # space from tag bottom to cut border
+        footer_h   = text_row_h + unit      # includes bottom 1-unit gap
+
+        total_w = size_px + 2 * unit        # 1 unit each side
+        total_h = size_px + top_gap + footer_h
+
         canvas = np.ones((total_h, total_w, 3), dtype=np.uint8) * 255
-        
-        # Paste tag
-        canvas[top_margin:top_margin+size_px, side_margin:side_margin+size_px] = tag_img_rgb
-        
-        # Draw text centered in the bottom margin
-        text_x = (total_w - text_w) // 2
-        text_y = top_margin + size_px + text_h + int((2.5 / 25.4) * dpi)
-        cv2.putText(canvas, text, (text_x, text_y), font, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
-        
-        # Draw 1px black border around the white margin for cutting
-        cv2.rectangle(canvas, (0, 0), (total_w - 1, total_h - 1), (0, 0, 0), 1)
-        
+
+        # ── Paste tag ────────────────────────────────────────────────────────
+        tag_y = top_gap
+        tag_x = unit
+        canvas[tag_y:tag_y + size_px, tag_x:tag_x + size_px] = tag_img_rgb
+
+        # ── ID text — centered horizontally in footer ────────────────────────
+        text_x = (total_w - tw) // 2
+        # Baseline sits at: tag_bottom + 1 unit gap + text height
+        text_y = tag_y + size_px + unit + th
+        cv2.putText(canvas, text, (text_x, text_y), font,
+                    font_scale, (0, 0, 0), text_thickness, cv2.LINE_AA)
+
+        # ── Cut-guide border ─────────────────────────────────────────────────
+        # Outer rectangle: flush with canvas edges (the 1-unit gap IS the margin)
+        cv2.rectangle(canvas,
+                      (0, 0),
+                      (total_w - 1, total_h - 1),
+                      (0, 0, 0), border_thickness)
+
+        # ── Footer side borders ──────────────────────────────────────────────
+        # Left side border: from tag bottom down to canvas bottom
+        footer_top = tag_y + size_px
+        cv2.line(canvas,
+                 (0, footer_top),
+                 (0, total_h - 1),
+                 (0, 0, 0), border_thickness)
+        # Right side border
+        cv2.line(canvas,
+                 (total_w - 1, footer_top),
+                 (total_w - 1, total_h - 1),
+                 (0, 0, 0), border_thickness)
+
+        # Horizontal divider between tag and footer text area
+        cv2.line(canvas,
+                 (0, footer_top),
+                 (total_w - 1, footer_top),
+                 (0, 0, 0), border_thickness)
+
+        # ── Save ─────────────────────────────────────────────────────────────
         final_img = Image.fromarray(canvas)
         final_img.info["dpi"] = (dpi, dpi)
-        
+
         if return_pil:
             return final_img
-        
-        # Save to buffer with DPI
+
         buf = io.BytesIO()
         final_img.save(buf, format="PDF", resolution=dpi)
         return buf.getvalue()
+
 
     @staticmethod
     def generate_batch_document(start_id: int, count: int, size_mm: float = 50.0, dpi: int = 300, 
