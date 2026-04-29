@@ -348,13 +348,15 @@ class AprilTagGenerator:
         (tw, th), baseline = cv2.getTextSize(text, font, font_scale, text_thickness)
 
         # ── Canvas dimensions ────────────────────────────────────────────────
-        # Top: 1 unit gap above tag
-        # Bottom: 1 unit gap (tag→text) + text height + baseline + 1 unit gap (text→border)
+        # Top:    1 unit gap above tag
+        # Middle: 1 unit gap below tag before divider line
+        # Footer: text height + baseline + 1 unit gap below text
         top_gap    = unit
-        text_row_h = th + baseline + unit   # space from tag bottom to cut border
-        footer_h   = text_row_h + unit      # includes bottom 1-unit gap
+        tag_gap    = unit          # white space between tag bottom and divider
+        text_row_h = th + baseline + unit
+        footer_h   = tag_gap + text_row_h + unit
 
-        total_w = size_px + 2 * unit        # 1 unit each side
+        total_w = size_px + 2 * unit
         total_h = size_px + top_gap + footer_h
 
         canvas = np.ones((total_h, total_w, 3), dtype=np.uint8) * 255
@@ -365,33 +367,31 @@ class AprilTagGenerator:
         canvas[tag_y:tag_y + size_px, tag_x:tag_x + size_px] = tag_img_rgb
 
         # ── ID text — centered horizontally in footer ────────────────────────
+        # Divider sits 1 unit below the tag bottom
+        footer_top = tag_y + size_px + tag_gap
         text_x = (total_w - tw) // 2
-        # Baseline sits at: tag_bottom + 1 unit gap + text height
-        text_y = tag_y + size_px + unit + th
+        # Text baseline sits 1 unit below the divider + text height
+        text_y = footer_top + unit + th
         cv2.putText(canvas, text, (text_x, text_y), font,
                     font_scale, (0, 0, 0), text_thickness, cv2.LINE_AA)
 
         # ── Cut-guide border ─────────────────────────────────────────────────
-        # Outer rectangle: flush with canvas edges (the 1-unit gap IS the margin)
         cv2.rectangle(canvas,
                       (0, 0),
                       (total_w - 1, total_h - 1),
                       (0, 0, 0), border_thickness)
 
-        # ── Footer side borders ──────────────────────────────────────────────
-        # Left side border: from tag bottom down to canvas bottom
-        footer_top = tag_y + size_px
+        # ── Footer side borders (extend from divider to bottom border) ───────
         cv2.line(canvas,
                  (0, footer_top),
                  (0, total_h - 1),
                  (0, 0, 0), border_thickness)
-        # Right side border
         cv2.line(canvas,
                  (total_w - 1, footer_top),
                  (total_w - 1, total_h - 1),
                  (0, 0, 0), border_thickness)
 
-        # Horizontal divider between tag and footer text area
+        # ── Horizontal divider between tag gap and footer text area ──────────
         cv2.line(canvas,
                  (0, footer_top),
                  (total_w - 1, footer_top),
