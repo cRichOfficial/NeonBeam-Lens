@@ -170,7 +170,12 @@ class InferenceService:
             sys.path.append("/usr/lib/python3/dist-packages")
 
         try:
-            import hailort
+            try:
+                import hailort
+            except ImportError:
+                # The Debian apt package installs it under the hailo_platform namespace
+                from hailo_platform import pyhailort as hailort
+
             logger.info(f"Loading Hailo HEF from {self.model_path}")
 
             if not os.path.exists(self.model_path):
@@ -188,9 +193,9 @@ class InferenceService:
             self.initialized = True
             logger.info("Hailo NPU initialized successfully.")
 
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
-                "hailort Python package not found but USE_HAILO=True. "
+                f"hailort Python package not found ({e}). "
                 "Install HailoRT Python bindings (.whl) from the Hailo Developer Zone."
             )
         except FileNotFoundError as e:
@@ -205,7 +210,11 @@ class InferenceService:
         import sys
         if "/usr/lib/python3/dist-packages" not in sys.path:
             sys.path.append("/usr/lib/python3/dist-packages")
-        import hailort
+        
+        try:
+            import hailort
+        except ImportError:
+            from hailo_platform import pyhailort as hailort
 
         orig_h, orig_w = image.shape[:2]
         size = self.model_input_size
