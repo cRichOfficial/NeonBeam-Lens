@@ -102,6 +102,8 @@ def _decode_yolov8_seg(outputs: Dict[str, np.ndarray], orig_h: int, orig_w: int,
             max_scores = _sigmoid(max_scores)
             cls_t = _sigmoid(cls_t)
 
+        logger.info(f"Scale {grid_size}x{grid_size}: Absolute highest confidence score is {float(np.max(max_scores)):.4f}")
+
         valid_mask = max_scores > conf_threshold
         if not np.any(valid_mask):
             continue
@@ -295,35 +297,42 @@ class InferenceService:
         )
         return self._build_workpiece_list(detections, orig_h, orig_w)
 
-    # ── Software Fallback (OpenCV) ────────────────────────────────────────────
-
     def _software_detect(self, image: np.ndarray) -> List[Dict]:
         """
         OpenCV-based fallback detector optimised for a black honeycomb laser bed.
-        Uses morphological closing to fill honeycomb holes before edge detection.
+        Uses CLAHE and Adaptive Thresholding to isolate workpieces.
         """
         orig_h, orig_w = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # Fill honeycomb cells with a large closing kernel
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (self.honeycomb_kernel, self.honeycomb_kernel)
+        # 1. Enhance contrast (helps separate dark slate coasters from dark bed)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+
+        # 2. Blur to destroy the fine lines of the honeycomb mesh
+        blurred = cv2.GaussianBlur(enhanced, (15, 15), 0)
+
+        # 3. Adaptive thresholding (finds large solid shapes, ignores global lighting gradients)
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY_INV, 51, 5
         )
-        closed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
 
-        # Edge detection
-        blurred = cv2.GaussianBlur(closed, (5, 5), 0)
-        edges = cv2.Canny(blurred, 50, 150)
-        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
+        # 4. Fill in holes (like text engraved on the coasters) and smooth edges
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.honeycomb_kernel, self.honeycomb_kernel))
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        
+        # 5. Dilate slightly to ensure the workpiece is one solid continuous blob
+        dilated = cv2.dilate(closed, kernel, iterations=1)
 
-        # Find outermost contours only (no honeycomb children)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Find outermost contours
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         detections = []
         for cnt in contours:
             area_px = cv2.contourArea(cnt)
-            if area_px < 500:   # pixel-space pre-filter (very small blobs)
+            # Filter out tiny noise and the massive frame around the edge of the bed
+            if area_px < 1000 or area_px > (orig_w * orig_h * 0.5):
                 continue
 
             # Build binary mask from contour
