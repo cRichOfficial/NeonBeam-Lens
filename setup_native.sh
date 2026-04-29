@@ -22,7 +22,7 @@ sudo apt-get install -y \
     python3-hailort
 
 # 2. Create virtual environment
-echo "[2/4] Creating virtual environment (.venv)..."
+echo "[2/5] Creating virtual environment (.venv)..."
 if [ ! -d ".venv" ]; then
     python3 -m venv .venv --system-site-packages
     echo "Created .venv (using system-site-packages for Hailo access)."
