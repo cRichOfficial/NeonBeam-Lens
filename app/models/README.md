@@ -20,29 +20,32 @@ used by the NeonBeam Lens inference service.
 
 ## How to Obtain
 
-The recommended way is to run `setup_native.sh`, which installs the official
-`hailo-apps` package from Hailo. This automatically downloads and installs HEF files
-compiled for **your exact installed HailoRT version**:
+The `hailo-all` apt package (installed as part of the Raspberry Pi AI Kit setup) installs
+the compatible, runtime-matched HEF files to `/usr/share/hailo-models/` automatically.
+
+**Simply ensure `hailo-all` is installed, then run `setup_native.sh`:**
 
 ```bash
-./setup_native.sh
+sudo apt install hailo-all   # if not already installed
+./setup_native.sh            # symlinks /usr/share/hailo-models/yolov8s_seg.hef → app/models/
 ```
 
-The HEF is installed system-wide to `/usr/share/hailo-models/yolov8s_seg.hef` and
-symlinked here as `app/models/yolov8s_seg.hef`.
+No additional downloads or compilation are needed.
 
 ---
 
-## Manual Installation
+## Manual Symlink
 
-If you need to install the HEF manually:
+If you need to symlink manually:
 
 ```bash
-git clone https://github.com/hailo-ai/hailo-apps.git
-cd hailo-apps
-sudo ./install.sh --no-tappas-required
-cd ..
 ln -s /usr/share/hailo-models/yolov8s_seg.hef app/models/yolov8s_seg.hef
+```
+
+To see all available system models:
+
+```bash
+ls /usr/share/hailo-models/
 ```
 
 ---

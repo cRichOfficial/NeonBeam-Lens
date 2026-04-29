@@ -108,9 +108,9 @@ journalctl -u neonbeam-lens -f
 
 NeonBeam Lens uses `yolov8s_seg` (YOLOv8 Small Instance Segmentation) compiled for the Hailo-8L.
 
-The HEF is automatically installed by `setup_native.sh` using the official `hailo-apps` installer, which ensures the model is compiled for your exact HailoRT runtime version. See `app/models/README.md` for details.
+The HEF is installed automatically by `sudo apt install hailo-all` to `/usr/share/hailo-models/`. Running `setup_native.sh` creates a symlink at `app/models/yolov8s_seg.hef` so the service can find it via the `MODEL_PATH` env var.
 
-> ⚠️ **Do not** download HEFs directly from the Hailo Model Zoo S3 bucket — they may be compiled for a different HailoRT version and will fail to load.
+No manual downloads or recompilation are needed. See `app/models/README.md` for details on switching model sizes.
 
 ---
 
