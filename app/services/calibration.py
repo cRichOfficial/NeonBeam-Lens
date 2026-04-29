@@ -4,8 +4,8 @@ import json
 import os
 import logging
 import io
-from PIL import Image
-from typing import List, Dict, Optional, Tuple
+from PIL import Image, ImageDraw
+from typing import List, Dict, Optional, Tuple, Union
 
 logger = logging.getLogger("vision_api.calibration")
 
@@ -129,10 +129,10 @@ class CalibrationService:
 
 class AprilTagGenerator:
     @staticmethod
-    def generate(tag_id: int, size_mm: float = 50.0, dpi: int = 300) -> bytes:
+    def generate(tag_id: int, size_mm: float = 50.0, dpi: int = 300, return_pil: bool = False) -> Union[bytes, Image.Image]:
         """
         Generate an AprilTag image with embedded DPI metadata for scaling.
-        Returns bytes of a PNG image.
+        Returns bytes of a PNG image or a PIL Image object.
         """
         # Calculate pixel size based on mm and DPI
         # 1 inch = 25.4 mm
@@ -149,12 +149,83 @@ class AprilTagGenerator:
         # Add a white border (standard for AprilTags to ensure detection)
         border_px = size_px // 10
         total_size = size_px + 2 * border_px
-        final_img = Image.new("L", (total_size, total_size), 255)
-        final_img.paste(pil_img, (border_px, border_px))
+        final_img = Image.new("RGB", (total_size, total_size), (255, 255, 255))
+        final_img.paste(pil_img.convert("RGB"), (border_px, border_px))
+        
+        # Draw a 1px black border around the white margin for cutting
+        draw = ImageDraw.Draw(final_img)
+        draw.rectangle([(0, 0), (total_size - 1, total_size - 1)], outline=(0, 0, 0), width=1)
+        
+        final_img.info["dpi"] = (dpi, dpi)
+        
+        if return_pil:
+            return final_img
         
         # Save to buffer with DPI
         buf = io.BytesIO()
         final_img.save(buf, format="PNG", dpi=(dpi, dpi))
+        return buf.getvalue()
+
+    @staticmethod
+    def generate_batch_document(start_id: int, count: int, size_mm: float = 50.0, dpi: int = 300, 
+                                paper_width_in: float = 8.5, paper_height_in: float = 11.0) -> bytes:
+        """
+        Generate a multi-page PDF containing the requested tags packed densely.
+        """
+        paper_w_px = int(paper_width_in * dpi)
+        paper_h_px = int(paper_height_in * dpi)
+        
+        # Get one tag to find its total size
+        sample_tag = AprilTagGenerator.generate(start_id, size_mm, dpi, return_pil=True)
+        tag_w, tag_h = sample_tag.size
+        
+        # Add padding between tags and page edges
+        padding_px = int(0.25 * dpi) # 0.25 inch margin
+        
+        usable_w = paper_w_px - 2 * padding_px
+        usable_h = paper_h_px - 2 * padding_px
+        
+        cols = max(1, usable_w // tag_w)
+        rows = max(1, usable_h // tag_h)
+        tags_per_page = cols * rows
+        
+        pages = []
+        current_page = None
+        
+        for i in range(count):
+            tag_id = start_id + i
+            tag_img = AprilTagGenerator.generate(tag_id, size_mm, dpi, return_pil=True)
+            
+            idx_on_page = i % tags_per_page
+            
+            if current_page is None or idx_on_page == 0:
+                if current_page is not None:
+                    pages.append(current_page)
+                # Create a new white page
+                current_page = Image.new("RGB", (paper_w_px, paper_h_px), (255, 255, 255))
+                current_page.info["dpi"] = (dpi, dpi)
+                
+            row = idx_on_page // cols
+            col = idx_on_page % cols
+            
+            x = padding_px + col * tag_w
+            y = padding_px + row * tag_h
+            
+            current_page.paste(tag_img, (x, y))
+            
+        if current_page is not None:
+            pages.append(current_page)
+            
+        if not pages:
+            return b""
+            
+        # Save pages as PDF
+        buf = io.BytesIO()
+        if len(pages) == 1:
+            pages[0].save(buf, format="PDF", resolution=dpi)
+        else:
+            pages[0].save(buf, format="PDF", resolution=dpi, save_all=True, append_images=pages[1:])
+            
         return buf.getvalue()
 
 # Global instance

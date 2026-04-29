@@ -99,7 +99,14 @@ async def batch_generate_tags(start_id: int = 0, count: int = 4, size_mm: float 
             "dpi": dpi,
             "download_url": f"/api/apriltag/generate/{tag_id}?size_mm={size_mm}&dpi={dpi}"
         })
-    return {"status": "ok", "tags": tags}
+    document_url = f"/api/apriltag/batch/document?start_id={start_id}&count={count}&size_mm={size_mm}&dpi={dpi}"
+    return {"status": "ok", "document_url": document_url, "tags": tags}
+
+@app.get("/api/apriltag/batch/document")
+async def batch_generate_document(start_id: int = 0, count: int = 4, size_mm: float = 50.0, dpi: int = 300):
+    """Return a multi-page PDF containing all requested tags packed for standard 8.5x11 printing."""
+    pdf_bytes = AprilTagGenerator.generate_batch_document(start_id, count, size_mm, dpi)
+    return Response(content=pdf_bytes, media_type="application/pdf")
 
 @app.post("/api/lens/calibrate")
 async def calibrate(request: CalibrationRequest):
