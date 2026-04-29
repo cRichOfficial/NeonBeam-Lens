@@ -163,7 +163,7 @@ class AprilTagGenerator:
         
         # Save to buffer with DPI
         buf = io.BytesIO()
-        final_img.save(buf, format="PNG", dpi=(dpi, dpi))
+        final_img.save(buf, format="PDF", resolution=dpi)
         return buf.getvalue()
 
     @staticmethod
