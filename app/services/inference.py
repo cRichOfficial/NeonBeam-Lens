@@ -173,8 +173,8 @@ class InferenceService:
             try:
                 import hailort
             except ImportError:
-                # The Debian apt package installs it under the hailo_platform namespace
-                from hailo_platform import pyhailort as hailort
+                # The Debian apt package exposes VDevice at the root of hailo_platform
+                import hailo_platform as hailort
 
             logger.info(f"Loading Hailo HEF from {self.model_path}")
 
@@ -214,7 +214,7 @@ class InferenceService:
         try:
             import hailort
         except ImportError:
-            from hailo_platform import pyhailort as hailort
+            import hailo_platform as hailort
 
         orig_h, orig_w = image.shape[:2]
         size = self.model_input_size
