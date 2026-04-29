@@ -132,30 +132,53 @@ class AprilTagGenerator:
     def generate(tag_id: int, size_mm: float = 50.0, dpi: int = 300, return_pil: bool = False) -> Union[bytes, Image.Image]:
         """
         Generate an AprilTag image with embedded DPI metadata for scaling.
-        Returns bytes of a PNG image or a PIL Image object.
+        Returns bytes of a PDF/PNG image or a PIL Image object.
         """
         # Calculate pixel size based on mm and DPI
         # 1 inch = 25.4 mm
         size_px = int((size_mm / 25.4) * dpi)
         
-        # AprilTags have a border, so we generate the marker slightly smaller 
-        # or just use the full size_px for the marker itself.
         aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         tag_img = cv2.aruco.generateImageMarker(aruco_dict, tag_id, size_px)
         
-        # Convert to PIL Image to set DPI metadata
-        pil_img = Image.fromarray(tag_img)
+        tag_img_rgb = cv2.cvtColor(tag_img, cv2.COLOR_GRAY2RGB)
         
-        # Add a white border (standard for AprilTags to ensure detection)
-        border_px = size_px // 10
-        total_size = size_px + 2 * border_px
-        final_img = Image.new("RGB", (total_size, total_size), (255, 255, 255))
-        final_img.paste(pil_img.convert("RGB"), (border_px, border_px))
+        # Define margins (use size_px // 5 to give a solid 2-module white safe zone)
+        top_margin = size_px // 5
+        side_margin = size_px // 5
         
-        # Draw a 1px black border around the white margin for cutting
-        draw = ImageDraw.Draw(final_img)
-        draw.rectangle([(0, 0), (total_size - 1, total_size - 1)], outline=(0, 0, 0), width=1)
+        # Calculate text size and bottom margin
+        text = f"ID: {tag_id}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
         
+        target_text_h_px = max(10, int((5.0 / 25.4) * dpi)) # 5mm height for text
+        
+        font_scale = 1.0
+        thickness = max(1, int(target_text_h_px / 20))
+        (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        font_scale = target_text_h_px / float(text_h)
+        (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        
+        bottom_margin = top_margin + text_h + baseline + int((5.0 / 25.4) * dpi) # space for text + 5mm padding
+        
+        total_w = size_px + 2 * side_margin
+        total_h = size_px + top_margin + bottom_margin
+        
+        # Create canvas
+        canvas = np.ones((total_h, total_w, 3), dtype=np.uint8) * 255
+        
+        # Paste tag
+        canvas[top_margin:top_margin+size_px, side_margin:side_margin+size_px] = tag_img_rgb
+        
+        # Draw text centered in the bottom margin
+        text_x = (total_w - text_w) // 2
+        text_y = top_margin + size_px + text_h + int((2.5 / 25.4) * dpi)
+        cv2.putText(canvas, text, (text_x, text_y), font, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
+        
+        # Draw 1px black border around the white margin for cutting
+        cv2.rectangle(canvas, (0, 0), (total_w - 1, total_h - 1), (0, 0, 0), 1)
+        
+        final_img = Image.fromarray(canvas)
         final_img.info["dpi"] = (dpi, dpi)
         
         if return_pil:
@@ -186,8 +209,11 @@ class AprilTagGenerator:
         usable_w = paper_w_px - 2 * margin_px
         usable_h = paper_h_px - 2 * margin_px
         
-        cols = max(1, usable_w // tag_w)
-        rows = max(1, usable_h // tag_h)
+        tag_padding_mm = 5.0
+        tag_padding_px = int((tag_padding_mm / 25.4) * dpi)
+        
+        cols = max(1, (usable_w + tag_padding_px) // (tag_w + tag_padding_px))
+        rows = max(1, (usable_h + tag_padding_px) // (tag_h + tag_padding_px))
         tags_per_page = cols * rows
         
         pages = []
@@ -209,8 +235,8 @@ class AprilTagGenerator:
             row = idx_on_page // cols
             col = idx_on_page % cols
             
-            x = margin_px + col * tag_w
-            y = margin_px + row * tag_h
+            x = margin_px + col * (tag_w + tag_padding_px)
+            y = margin_px + row * (tag_h + tag_padding_px)
             
             current_page.paste(tag_img, (x, y))
             
