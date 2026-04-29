@@ -120,6 +120,18 @@ async def get_calibration():
     """Retrieve current calibration status and stored parameters."""
     return calibration_service.get_status()
 
+@app.get("/api/lens/calibration/check")
+async def check_calibration():
+    """
+    Live calibration quality check.
+    Detects visible AprilTags in the current frame, maps them through the
+    homography, and returns per-tag reprojection error in mm.
+    """
+    frame = camera_service.get_frame()
+    if frame is None:
+        raise HTTPException(status_code=503, detail="Camera frame not available")
+    return calibration_service.check_calibration(frame)
+
 @app.get("/api/lens/detect")
 async def detect_objects():
     frame = camera_service.get_frame()

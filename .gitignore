@@ -14,9 +14,10 @@ venv/
 *.log
 logs/
 
-# Large model files — store in Git LFS or artifact registry instead
-models/*.hef
-models/*.onnx
+# Large model files — obtained via setup_native.sh, not committed
+*.hef
+*.onnx
+hailo-apps/
 
 # Camera calibration data (large binary)
 calibration_data/*.npz

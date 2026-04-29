@@ -144,6 +144,76 @@ class CalibrationService:
             "calibration_data": self.calibration_data
         }
 
+    def check_calibration(self, image: np.ndarray) -> Dict:
+        """
+        Live calibration quality check.
+        Detects visible AprilTags in the frame, maps their pixel centers through
+        the homography, and compares to the stored physical positions.
+        Returns per-tag reprojection error in mm and overall mean error.
+        """
+        if self.homography_matrix is None:
+            return {"status": "uncalibrated", "error": "No calibration data found."}
+
+        if self.calibration_data is None:
+            return {
+                "status": "calibrated",
+                "warning": "Calibration matrix exists but no tag metadata was stored. "
+                           "Re-run calibration to enable quality checking.",
+                "per_tag_errors": [],
+                "mean_error_mm": None,
+            }
+
+        detected = self.detect_tags(image)
+        if not detected:
+            return {
+                "status": "calibrated",
+                "warning": "No AprilTags visible in current frame.",
+                "per_tag_errors": [],
+                "mean_error_mm": None,
+            }
+
+        # Build physical position lookup from stored calibration_data
+        phys_map = {p["id"]: p for p in self.calibration_data.get("physical_data", [])}
+
+        per_tag_errors = []
+        for tag in detected:
+            tid = tag["id"]
+            if tid not in phys_map:
+                continue
+
+            p = phys_map[tid]
+            corners = np.array(tag["corners"])
+            center_px = corners.mean(axis=0).reshape(1, 2).astype(np.float32)
+            center_mm = self.map_pixels_to_mm(center_px)[0]
+
+            expected_mm = np.array([p["x"], p["y"]], dtype=np.float32)
+            error_mm = float(np.linalg.norm(center_mm - expected_mm))
+
+            per_tag_errors.append({
+                "tag_id": tid,
+                "detected_center_mm": center_mm.tolist(),
+                "expected_mm": expected_mm.tolist(),
+                "error_mm": round(error_mm, 2),
+            })
+
+        if not per_tag_errors:
+            return {
+                "status": "calibrated",
+                "warning": "Detected tags do not match any stored calibration tags.",
+                "per_tag_errors": [],
+                "mean_error_mm": None,
+            }
+
+        mean_error = round(float(np.mean([t["error_mm"] for t in per_tag_errors])), 2)
+        quality = "good" if mean_error < 5.0 else "poor"
+
+        return {
+            "status": "calibrated",
+            "quality": quality,
+            "mean_error_mm": mean_error,
+            "per_tag_errors": per_tag_errors,
+        }
+
 class AprilTagGenerator:
     @staticmethod
     def generate(tag_id: int, size_mm: float = 50.0, dpi: int = 300, return_pil: bool = False) -> Union[bytes, Image.Image]:

@@ -36,10 +36,33 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 # 4. Create necessary directories
-echo "[4/4] Creating data directories..."
-mkdir -p calibration_data models
+echo "[4/5] Creating data directories..."
+mkdir -p calibration_data app/models
 
-# 5. Make start script executable
+# 5. Install hailo-apps to obtain a runtime-compatible segmentation HEF
+echo "[5/5] Checking for Hailo segmentation model..."
+HEF_PATH="/usr/share/hailo-models/yolov8s_seg.hef"
+
+if [ ! -f "$HEF_PATH" ]; then
+    echo "  HEF not found at $HEF_PATH — installing hailo-apps..."
+    if [ ! -d "hailo-apps" ]; then
+        git clone https://github.com/hailo-ai/hailo-apps.git
+    fi
+    cd hailo-apps
+    sudo ./install.sh --no-tappas-required
+    cd ..
+    echo "  hailo-apps installed. HEF available at $HEF_PATH"
+else
+    echo "  Hailo segmentation model already installed at $HEF_PATH."
+fi
+
+# Symlink into app/models/ for easy reference by the service
+if [ ! -f "app/models/yolov8s_seg.hef" ] && [ -f "$HEF_PATH" ]; then
+    ln -s "$HEF_PATH" app/models/yolov8s_seg.hef
+    echo "  Symlinked $HEF_PATH -> app/models/yolov8s_seg.hef"
+fi
+
+# Make start script executable
 chmod +x start_lens.sh
 
 # 6. Setup systemd service
