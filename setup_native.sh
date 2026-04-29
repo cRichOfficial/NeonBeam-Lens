@@ -45,26 +45,17 @@ sudo apt-get install -y $TARGET_PY ${TARGET_PY}-venv ${TARGET_PY}-dev
 echo "[2/5] Creating virtual environment (.venv) using $TARGET_PY..."
 
 if [ -d ".venv" ]; then
-    # Ensure existing venv matches the target python
-    VENV_PY=$(.venv/bin/python --version 2>&1)
-    if [[ "$VENV_PY" != *"${TARGET_PY#python}"* ]]; then
-        echo "Existing .venv is not $TARGET_PY ($VENV_PY). Rebuilding..."
-        rm -rf .venv
-    fi
+    rm -rf .venv
 fi
 
-if [ ! -d ".venv" ]; then
-    $TARGET_PY -m venv .venv --system-site-packages
-    echo "Created .venv with $TARGET_PY and --system-site-packages."
-else
-    echo ".venv already exists and matches $TARGET_PY."
-fi
+$TARGET_PY -m venv .venv --system-site-packages
+echo "Created .venv with $TARGET_PY and --system-site-packages."
 
 # 3. Install Python dependencies
-echo "[3/4] Installing Python requirements..."
+echo "[3/5] Installing Python requirements (ignoring system packages to prevent conflicts)..."
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install --ignore-installed -r requirements.txt
 
 # 4. Create necessary directories
 echo "[4/5] Creating data directories..."
