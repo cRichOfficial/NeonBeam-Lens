@@ -50,89 +50,124 @@ def _decode_yolov8_seg(outputs: Dict[str, np.ndarray], orig_h: int, orig_w: int,
                         conf_threshold: float = 0.4, iou_threshold: float = 0.45,
                         model_size: int = 640) -> List[Dict]:
     """
-    Decode YOLOv8-seg raw Hailo output tensors into detections with masks.
-
-    Expected output keys (from hailortcli parse-hef):
-      - Primary detection tensor: shape (1, num_anchors, 4 + num_classes + 32)
-      - Prototype masks tensor:   shape (1, 32, H/4, W/4)
-
-    The exact key names vary by HEF; we find them heuristically by shape.
+    Decode raw un-fused YOLOv8-seg tensors from the Hailo hardware.
+    The hardware returns 10 tensors: 3 scales (80x80, 40x40, 20x20) * 3 branches 
+    (box DFL, class scores, mask coeffs) + 1 prototype mask tensor.
     """
-    results = []
-    
-    # Debug: log the exact shapes we get from the Hailo hardware
-    shapes = {k: v.shape for k, v in outputs.items()}
-    logger.info(f"Hailo raw output shapes: {shapes}")
-
-    # ── Find detection and prototype tensors by shape heuristics ──
-    detection_tensor = None
+    scales = {80: {}, 40: {}, 20: {}}
     proto_tensor = None
 
+    # Sort tensors by spatial grid size and feature type
     for name, tensor in outputs.items():
-        t = tensor.squeeze(0)  # remove batch dim
-        if t.ndim == 2 and t.shape[1] > 80:
-            # shape (num_anchors, 4+classes+32)
-            detection_tensor = t
-        elif t.ndim == 3 and t.shape[0] == 32:
-            # shape (32, h, w) — prototype masks
-            proto_tensor = t
+        t = tensor.squeeze(0)  # Remove batch dim: (H, W, C)
+        h, w, c = t.shape
+        if h == 160 and w == 160 and c == 32:
+            proto_tensor = t.transpose(2, 0, 1)  # Convert to (32, 160, 160) for matmul
+            continue
+            
+        if h in scales:
+            if c == 80:
+                # Sigmoid is usually applied in hardware for class scores, but let's be safe
+                # If values are > 1, it needs sigmoid. Usually hailort normalizes it.
+                scales[h]['cls'] = t 
+            elif c == 64:
+                scales[h]['reg'] = t
+            elif c == 32:
+                scales[h]['mask'] = t
 
-    if detection_tensor is None:
-        logger.warning("Could not find detection tensor in Hailo output.")
+    all_boxes = []
+    all_scores = []
+    all_class_ids = []
+    all_mask_coeffs = []
+
+    dfl_weights = np.arange(16, dtype=np.float32)
+
+    def softmax(x):
+        e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+        return e_x / e_x.sum(axis=-1, keepdims=True)
+
+    for grid_size, tensors in scales.items():
+        if 'cls' not in tensors or 'reg' not in tensors:
+            continue
+            
+        stride = model_size / grid_size
+        cls_t = tensors['cls']
+        reg_t = tensors['reg']
+        mask_t = tensors.get('mask')
+
+        # Find anchors exceeding confidence threshold
+        max_scores = np.max(cls_t, axis=-1)
+        # Apply sigmoid if hardware didn't (Hailo usually outputs logits if un-fused)
+        if np.max(max_scores) > 1.0 or np.min(max_scores) < 0.0:
+            max_scores = _sigmoid(max_scores)
+            cls_t = _sigmoid(cls_t)
+
+        valid_mask = max_scores > conf_threshold
+        if not np.any(valid_mask):
+            continue
+
+        y_idx, x_idx = np.where(valid_mask)
+        scores = max_scores[valid_mask]
+        class_ids = np.argmax(cls_t[valid_mask], axis=-1)
+        
+        reg_features = reg_t[valid_mask].reshape(-1, 4, 16)
+        mask_coeffs = mask_t[valid_mask] if mask_t is not None else np.zeros((len(scores), 32))
+
+        # Decode DFL (Distribution Focal Loss)
+        dist = softmax(reg_features)
+        pred_dist = np.sum(dist * dfl_weights, axis=-1)
+
+        anchor_x = (x_idx + 0.5) * stride
+        anchor_y = (y_idx + 0.5) * stride
+
+        x1 = anchor_x - pred_dist[:, 0] * stride
+        y1 = anchor_y - pred_dist[:, 1] * stride
+        x2 = anchor_x + pred_dist[:, 2] * stride
+        y2 = anchor_y + pred_dist[:, 3] * stride
+
+        boxes = np.stack([x1, y1, x2, y2], axis=-1)
+
+        all_boxes.append(boxes)
+        all_scores.append(scores)
+        all_class_ids.append(class_ids)
+        all_mask_coeffs.append(mask_coeffs)
+
+    if not all_boxes:
         return []
 
-    num_classes = detection_tensor.shape[1] - 4 - 32
-    boxes_raw = detection_tensor[:, :4]
-    class_scores = detection_tensor[:, 4:4 + num_classes]
-    mask_coeffs = detection_tensor[:, 4 + num_classes:]
+    boxes = np.concatenate(all_boxes, axis=0)
+    scores = np.concatenate(all_scores, axis=0)
+    class_ids = np.concatenate(all_class_ids, axis=0)
+    mask_coeffs = np.concatenate(all_mask_coeffs, axis=0)
 
-    # Confidence = max class score
-    confidences = class_scores.max(axis=1)
-    class_ids = class_scores.argmax(axis=1)
-
-    # Filter by threshold
-    mask = confidences >= conf_threshold
-    if not mask.any():
-        return []
-
-    boxes_raw = boxes_raw[mask]
-    confidences = confidences[mask]
-    class_ids = class_ids[mask]
-    mask_coeffs = mask_coeffs[mask]
-
-    # Decode boxes from model space → original image space
+    # Scale to original image
     scale_x = orig_w / model_size
     scale_y = orig_h / model_size
-    boxes_xyxy = _xywh2xyxy(boxes_raw)
-    boxes_xyxy[:, [0, 2]] *= scale_x
-    boxes_xyxy[:, [1, 3]] *= scale_y
-    boxes_xyxy = np.clip(boxes_xyxy, 0,
-                          [[orig_w, orig_h, orig_w, orig_h]])
+    boxes[:, [0, 2]] *= scale_x
+    boxes[:, [1, 3]] *= scale_y
+    boxes = np.clip(boxes, 0, [[orig_w, orig_h, orig_w, orig_h]])
 
     # NMS
-    kept = _nms(boxes_xyxy, confidences, iou_threshold)
+    kept = _nms(boxes, scores, iou_threshold)
+    results = []
 
     for idx in kept:
-        x1, y1, x2, y2 = boxes_xyxy[idx].astype(int)
+        x1, y1, x2, y2 = boxes[idx].astype(int)
 
-        # Reconstruct instance mask if prototype tensor is available
         if proto_tensor is not None:
-            # mask_coeffs[idx]: (32,); proto_tensor: (32, ph, pw)
+            # Mask generation: dot product of coefficients with prototype masks
             ph, pw = proto_tensor.shape[1], proto_tensor.shape[2]
             mask_logits = (mask_coeffs[idx] @ proto_tensor.reshape(32, -1)).reshape(ph, pw)
             instance_mask = (_sigmoid(mask_logits) > 0.5).astype(np.uint8)
-            # Resize to original frame size
-            instance_mask = cv2.resize(instance_mask, (orig_w, orig_h),
-                                       interpolation=cv2.INTER_NEAREST)
+            instance_mask = cv2.resize(instance_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
         else:
-            # Fallback: rectangular mask from bounding box
             instance_mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
             instance_mask[y1:y2, x1:x2] = 1
 
         results.append({
             "_box": [x1, y1, x2, y2],
             "_mask": instance_mask,
-            "_confidence": float(confidences[idx]),
+            "_confidence": float(scores[idx]),
             "_class_id": int(class_ids[idx]),
         })
 

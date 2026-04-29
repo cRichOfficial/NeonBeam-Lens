@@ -24,6 +24,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vision_api")
 
+# Silence noisy external libraries
+logging.getLogger("picamera2").setLevel(logging.WARNING)
+logging.getLogger("libcamera").setLevel(logging.WARNING)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
