@@ -42,15 +42,46 @@ class CameraService:
         """Start the background frame capture thread."""
         if self.running:
             return
-        
+
+        # Optional resolution cap from env: "WIDTHxHEIGHT" e.g. "4056x3040"
+        # Defaults to "max" which uses the sensor's full native resolution.
+        res_env = os.getenv("CAMERA_RESOLUTION", "max").strip().lower()
+
         if HAS_PICAMERA2:
             try:
                 self.picam2 = Picamera2()
-                # Configure for 1280x720 BGR (OpenCV format)
-                config = self.picam2.create_video_configuration(main={"format": "BGR888", "size": (1280, 720)})
+
+                if res_env == "max":
+                    # Query the sensor's full pixel array size — the true hardware maximum
+                    sensor_res = self.picam2.camera_properties.get("PixelArraySize")
+                    if sensor_res:
+                        capture_w, capture_h = sensor_res
+                        logger.info(f"Picamera2: using max sensor resolution {capture_w}x{capture_h}")
+                    else:
+                        # Fallback: pick the largest mode available
+                        modes = self.picam2.sensor_modes
+                        if modes:
+                            largest = max(modes, key=lambda m: m["size"][0] * m["size"][1])
+                            capture_w, capture_h = largest["size"]
+                            logger.info(f"Picamera2: largest sensor mode {capture_w}x{capture_h}")
+                        else:
+                            capture_w, capture_h = 4056, 3040  # Pi HQ safe default
+                            logger.warning("Picamera2: could not detect sensor modes, defaulting to 4056x3040")
+                else:
+                    try:
+                        capture_w, capture_h = [int(v) for v in res_env.split("x")]
+                        logger.info(f"Picamera2: using configured resolution {capture_w}x{capture_h}")
+                    except ValueError:
+                        logger.warning(f"Invalid CAMERA_RESOLUTION '{res_env}', falling back to max")
+                        sensor_res = self.picam2.camera_properties.get("PixelArraySize", (4056, 3040))
+                        capture_w, capture_h = sensor_res
+
+                config = self.picam2.create_video_configuration(
+                    main={"format": "BGR888", "size": (capture_w, capture_h)}
+                )
                 self.picam2.configure(config)
                 self.picam2.start()
-                logger.info("Picamera2 started successfully")
+                logger.info(f"Picamera2 started at {capture_w}x{capture_h}")
             except Exception as e:
                 logger.error(f"Failed to start Picamera2: {e}")
                 return False
@@ -59,8 +90,23 @@ class CameraService:
             if not self.cap.isOpened():
                 logger.error(f"Failed to open camera {self.camera_id} via OpenCV")
                 return False
-            logger.info("OpenCV VideoCapture started (fallback)")
-        
+
+            if res_env == "max":
+                # Request an absurdly large resolution — the driver will clamp to its maximum
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 9999)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 9999)
+            elif "x" in res_env:
+                try:
+                    w, h = [int(v) for v in res_env.split("x")]
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                except ValueError:
+                    pass
+
+            actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            logger.info(f"OpenCV VideoCapture started at {actual_w}x{actual_h}")
+
         self.running = True
         self.thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.thread.start()
@@ -86,7 +132,10 @@ class CameraService:
                 if self.picam2:
                     frame = self.picam2.capture_array()
                     if frame is not None:
-                        self.last_frame = frame
+                        # Picamera2 capture_array() returns RGB regardless of
+                        # the BGR888 format config. Convert to BGR so all
+                        # downstream OpenCV code and cv2.imwrite work correctly.
+                        self.last_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 elif self.cap:
                     ret, frame = self.cap.read()
                     if ret:
