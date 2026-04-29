@@ -75,18 +75,53 @@ class CalibrationService:
                 p = phys_map[tid]
                 corners = np.array(tag['corners'])
                 
-                # If anchor is center, we map the center of the corners to (p['x'], p['y'])
-                # However, for better accuracy, we should map all 4 corners if size_mm is known.
+                # Map corners based on the specified anchor and tag size
                 if 'size_mm' in p:
-                    s = p['size_mm'] / 2.0
-                    # Physical corners relative to center
-                    # Aruco corners order: TL, TR, BR, BL
-                    target_corners = [
-                        [p['x'] - s, p['y'] - s], # TL
-                        [p['x'] + s, p['y'] - s], # TR
-                        [p['x'] + s, p['y'] + s], # BR
-                        [p['x'] - s, p['y'] + s]  # BL
-                    ]
+                    s = p['size_mm']
+                    half = s / 2.0
+                    px, py = p['x'], p['y']
+                    anchor = p.get('anchor', 'center').lower().replace('_', '-')
+                    
+                    # Aruco corners are always returned in order: TL, TR, BR, BL
+                    if anchor == 'center':
+                        target_corners = [
+                            [px - half, py - half], # TL
+                            [px + half, py - half], # TR
+                            [px + half, py + half], # BR
+                            [px - half, py + half]  # BL
+                        ]
+                    elif anchor in ['top-left', 'tl']:
+                        target_corners = [
+                            [px, py],           # TL
+                            [px + s, py],       # TR
+                            [px + s, py + s],   # BR
+                            [px, py + s]        # BL
+                        ]
+                    elif anchor in ['top-right', 'tr']:
+                        target_corners = [
+                            [px - s, py],       # TL
+                            [px, py],           # TR
+                            [px, py + s],       # BR
+                            [px - s, py + s]    # BL
+                        ]
+                    elif anchor in ['bottom-right', 'br']:
+                        target_corners = [
+                            [px - s, py - s],   # TL
+                            [px, py - s],       # TR
+                            [px, py],           # BR
+                            [px - s, py]        # BL
+                        ]
+                    elif anchor in ['bottom-left', 'bl']:
+                        target_corners = [
+                            [px, py - s],       # TL
+                            [px + s, py - s],   # TR
+                            [px + s, py],       # BR
+                            [px, py]            # BL
+                        ]
+                    else:
+                        # Default to center
+                        target_corners = [[px-half, py-half], [px+half, py-half], [px+half, py+half], [px-half, py+half]]
+                    
                     src_pts.extend(corners)
                     dst_pts.extend(target_corners)
                 else:
