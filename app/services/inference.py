@@ -300,17 +300,21 @@ class InferenceService:
     def _software_detect(self, image: np.ndarray) -> List[Dict]:
         """
         OpenCV-based fallback detector optimized for a black honeycomb laser bed.
-        Uses Red-channel analysis and heavy morphological closing to bridge gaps.
+        Uses CLAHE-enhanced Red channel and heavy morphological closing.
         """
         orig_h, orig_w = image.shape[:2]
         
-        # 1. Use the Red channel (usually highest contrast for workpieces on these beds)
+        # 1. Use the Red channel
         red = image[:, :, 2]
 
-        # 2. Aggressive Blur to merge honeycomb texture into a solid background
-        blurred = cv2.GaussianBlur(red, (21, 21), 0)
+        # 2. Enhance contrast to find dark slate on dark bed
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(red)
 
-        # 3. Otsu's Binarization to find the best split between "bed" and "objects"
+        # 3. Aggressive Blur to merge honeycomb texture
+        blurred = cv2.GaussianBlur(enhanced, (15, 15), 0)
+
+        # 4. Otsu's Binarization
         _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
         # 4. Mask out everything outside the detected AprilTags (ROI Locking)

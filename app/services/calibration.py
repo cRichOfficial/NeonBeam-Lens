@@ -161,13 +161,16 @@ class CalibrationService:
 
     def undistort(self, image: np.ndarray) -> np.ndarray:
         """Apply fisheye undistortion if enabled."""
-        if not self.is_fisheye:
+        if not self.is_fisheye or hasattr(image, '_neon_undistorted'):
             return image
         
         h, w = image.shape[:2]
         # Estimate new camera matrix to keep the full FOV
         new_k = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(self.k, self.d, (w, h), np.eye(3), balance=1.0)
         undistorted = cv2.fisheye.undistortImage(image, self.k, self.d, Knew=new_k)
+        
+        # Mark as processed to prevent double-undistortion
+        setattr(undistorted, '_neon_undistorted', True)
         return undistorted
 
     def map_pixels_to_mm(self, points_px: np.ndarray) -> np.ndarray:
