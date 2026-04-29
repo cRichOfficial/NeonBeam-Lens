@@ -59,6 +59,10 @@ def _decode_yolov8_seg(outputs: Dict[str, np.ndarray], orig_h: int, orig_w: int,
     The exact key names vary by HEF; we find them heuristically by shape.
     """
     results = []
+    
+    # Debug: log the exact shapes we get from the Hailo hardware
+    shapes = {k: v.shape for k, v in outputs.items()}
+    logger.info(f"Hailo raw output shapes: {shapes}")
 
     # ── Find detection and prototype tensors by shape heuristics ──
     detection_tensor = None
