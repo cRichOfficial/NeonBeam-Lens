@@ -229,16 +229,18 @@ class InferenceService:
             input_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
         input_img = input_img.astype(np.uint8)
 
-        input_params = self.network_group.create_input_vstream_params(
-            quantized=False, format_type=hailort.FormatType.UINT8
+        input_params = hailort.InputVStreamParams.make_from_network_group(
+            self.network_group, quantized=False, format_type=hailort.FormatType.UINT8
         )
-        output_params = self.network_group.create_output_vstream_params(
-            quantized=False, format_type=hailort.FormatType.FLOAT32
+        output_params = hailort.OutputVStreamParams.make_from_network_group(
+            self.network_group, quantized=False, format_type=hailort.FormatType.FLOAT32
         )
 
-        with hailort.InferVStreams(self.network_group, input_params, output_params) as pipeline:
-            input_data = {self.input_vstream_infos[0].name: np.expand_dims(input_img, 0)}
-            raw_outputs = pipeline.infer(input_data)
+        network_group_params = self.network_group.create_params()
+        with self.network_group.activate(network_group_params):
+            with hailort.InferVStreams(self.network_group, input_params, output_params) as pipeline:
+                input_data = {self.input_vstream_infos[0].name: np.expand_dims(input_img, 0)}
+                raw_outputs = pipeline.infer(input_data)
 
         detections = _decode_yolov8_seg(
             raw_outputs, orig_h, orig_w,
