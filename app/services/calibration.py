@@ -16,8 +16,8 @@ class CalibrationService:
         self.homography_matrix = None
         self.calibration_data = None
         
-        # Generic Fisheye Calibration for 175 FOV lenses
-        self.is_fisheye = os.getenv("FISHEYE_LENS", "True").lower() == "true"
+        # Generic Fisheye Calibration for 175 FOV lenses (Disabled by default)
+        self.is_fisheye = os.getenv("FISHEYE_LENS", "False").lower() == "true"
         # Standard estimates for a 1/4" sensor with 175 FOV
         self.k = np.array([[600, 0, 640], [0, 600, 360], [0, 0, 1]], dtype=np.float32)
         self.d = np.array([-0.05, -0.01, 0, 0], dtype=np.float32)
