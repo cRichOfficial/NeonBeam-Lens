@@ -303,40 +303,43 @@ class InferenceService:
     def _software_detect(self, image: np.ndarray) -> List[Dict]:
         """
         OpenCV-based fallback detector optimized for a black honeycomb laser bed.
-        Uses a dual-threshold strategy to handle both dark and light workpieces
-        under uneven illumination (e.g. wood table reflection through honeycomb holes).
+
+        Uses local background subtraction to handle uneven illumination caused by
+        the wood table reflecting through the honeycomb holes. By estimating the
+        'ambient' light level with a very large Gaussian blur and subtracting it
+        from the enhanced image, the gradual reflection gradient cancels out and
+        only solid objects (coasters) that differ sharply from their surroundings
+        are kept.
         """
         orig_h, orig_w = image.shape[:2]
 
-        # 1. Use the Red channel (best contrast in IR-lit environments)
-        red = image[:, :, 2]
+        # 1. Convert to grayscale — captures both light and dark objects uniformly
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # 2. CLAHE contrast enhancement on a local tile basis.
-        #    tileGridSize controls tile size — smaller tiles = more local contrast.
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16, 16))
-        enhanced = clahe.apply(red)
+        # 2. CLAHE — boost local contrast so dark objects (slate) stand out from
+        #    the dark honeycomb bed before we do any global operations
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
 
-        # 3. Gentle blur to reduce honeycomb dot texture without losing object edges
-        blurred = cv2.GaussianBlur(enhanced, (11, 11), 0)
+        # 3. Fine blur — smooths the honeycomb dot texture without losing object edges
+        fine_blur = cv2.GaussianBlur(enhanced, (11, 11), 0)
 
-        # 4a. Adaptive threshold — handles uneven illumination (e.g. table reflection)
-        #     Block size must be odd; 151px covers a large enough area to normalise
-        #     the reflection gradient while still responding to object boundaries.
-        adaptive = cv2.adaptiveThreshold(
-            blurred, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            blockSize=151,
-            C=-10   # negative C = keep pixels brighter than local mean
-        )
+        # 4. Coarse blur — estimates the ambient illumination field.
+        #    This kernel must be MUCH larger than the largest workpiece so that
+        #    the coaster itself averages into the background estimate.
+        #    At ~100px (≈10% of frame width) it captures the slow reflection
+        #    gradient while the 100mm coaster (~140px wide) does not disappear.
+        coarse_blur = cv2.GaussianBlur(enhanced, (101, 101), 0)
 
-        # 4b. Fixed high-value threshold — explicitly catches very bright/light
-        #     objects (e.g. white wood coaster) that may be washed out by the
-        #     adaptive step if the local neighbourhood is also bright.
-        _, bright = cv2.threshold(blurred, 180, 255, cv2.THRESH_BINARY)
+        # 5. Background-subtracted image.
+        #    Pixels on a solid object deviate from their local background average,
+        #    so they appear bright in the diff image regardless of absolute brightness.
+        #    The smooth table reflection gradient divides out to near-zero.
+        diff = cv2.absdiff(fine_blur, coarse_blur)
 
-        # 4c. Combine both passes — any pixel found by either method is kept
-        thresh = cv2.bitwise_or(adaptive, bright)
+        # 6. Normalise to use the full 0-255 range, then threshold
+        diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+        _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
 
         # 4. Mask out everything outside the detected AprilTags (ROI Locking)
         # This prevents detection of aluminum rails and distorted edge artifacts.
