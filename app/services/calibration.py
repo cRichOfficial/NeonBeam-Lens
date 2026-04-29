@@ -14,6 +14,13 @@ class CalibrationService:
         self.data_path = data_path
         self.homography_matrix = None
         self.calibration_data = None
+        
+        # Generic Fisheye Calibration for 175 FOV lenses
+        self.is_fisheye = os.getenv("FISHEYE_LENS", "True").lower() == "true"
+        # Standard estimates for a 1/4" sensor with 175 FOV
+        self.k = np.array([[600, 0, 640], [0, 600, 360], [0, 0, 1]], dtype=np.float32)
+        self.d = np.array([-0.05, -0.01, 0, 0], dtype=np.float32)
+        
         self.load_calibration()
         
         # AprilTag setup (using Aruco module)
@@ -147,6 +154,17 @@ class CalibrationService:
             self.save_calibration(matrix, calib_data)
             return matrix
         return None
+
+    def undistort(self, image: np.ndarray) -> np.ndarray:
+        """Apply fisheye undistortion if enabled."""
+        if not self.is_fisheye:
+            return image
+        
+        h, w = image.shape[:2]
+        # Estimate new camera matrix to keep the full FOV
+        new_k = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(self.k, self.d, (w, h), np.eye(3), balance=1.0)
+        undistorted = cv2.fisheye.undistortImage(image, self.k, self.d, Knew=new_k)
+        return undistorted
 
     def map_pixels_to_mm(self, points_px: np.ndarray) -> np.ndarray:
         """Transform pixel coordinates to physical mm."""

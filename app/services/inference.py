@@ -444,6 +444,10 @@ class InferenceService:
         if not self.initialized or image is None:
             return []
 
+        # Step 0: Undistort the fisheye lens before processing
+        from .calibration import calibration_service
+        image = calibration_service.undistort(image)
+
         if self.use_hailo:
             results = self._run_hailo_inference(image)
             # If NPU found nothing confident, try software fallback
