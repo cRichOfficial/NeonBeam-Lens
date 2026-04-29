@@ -13,6 +13,7 @@ class CalibrationService:
     def __init__(self, data_path: str = "calibration_data/matrix.json"):
         self.data_path = data_path
         self.homography_matrix = None
+        self.calibration_data = None
         self.load_calibration()
         
         # AprilTag setup (using Aruco module)
@@ -27,17 +28,19 @@ class CalibrationService:
                 with open(self.data_path, 'r') as f:
                     data = json.load(f)
                     self.homography_matrix = np.array(data['matrix'])
+                    self.calibration_data = data.get('calibration_data', None)
                 logger.info(f"Loaded calibration from {self.data_path}")
             except Exception as e:
                 logger.error(f"Failed to load calibration: {e}")
 
-    def save_calibration(self, matrix: np.ndarray):
+    def save_calibration(self, matrix: np.ndarray, calibration_data: Dict = None):
         """Save calibration matrix to JSON file."""
         self.homography_matrix = matrix
+        self.calibration_data = calibration_data
         os.makedirs(os.path.dirname(self.data_path), exist_ok=True)
         try:
             with open(self.data_path, 'w') as f:
-                json.dump({'matrix': matrix.tolist()}, f)
+                json.dump({'matrix': matrix.tolist(), 'calibration_data': calibration_data}, f)
             logger.info(f"Saved calibration to {self.data_path}")
         except Exception as e:
             logger.error(f"Failed to save calibration: {e}")
@@ -100,7 +103,11 @@ class CalibrationService:
         
         matrix, status = cv2.findHomography(src_pts, dst_pts)
         if matrix is not None:
-            self.save_calibration(matrix)
+            calib_data = {
+                "detected_tags": detected_tags,
+                "physical_data": physical_data
+            }
+            self.save_calibration(matrix, calib_data)
             return matrix
         return None
 
@@ -126,6 +133,16 @@ class CalibrationService:
         h_inv = np.linalg.inv(self.homography_matrix)
         warped = cv2.warpPerspective(image, h_inv, size_mm)
         return warped
+
+    def get_status(self) -> Dict:
+        """Return the current calibration status and data."""
+        if self.homography_matrix is None:
+            return {"status": "uncalibrated"}
+        return {
+            "status": "calibrated",
+            "matrix": self.homography_matrix.tolist(),
+            "calibration_data": self.calibration_data
+        }
 
 class AprilTagGenerator:
     @staticmethod

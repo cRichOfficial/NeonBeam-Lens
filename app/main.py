@@ -115,6 +115,11 @@ async def calibrate(request: CalibrationRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/api/lens/calibration")
+async def get_calibration():
+    """Retrieve current calibration status and stored parameters."""
+    return calibration_service.get_status()
+
 @app.get("/api/lens/detect")
 async def detect_objects():
     frame = camera_service.get_frame()
