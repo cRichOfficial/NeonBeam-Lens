@@ -21,6 +21,10 @@ class CalibrationService:
         # Standard estimates for a 1/4" sensor with 175 FOV
         self.k = np.array([[600, 0, 640], [0, 600, 360], [0, 0, 1]], dtype=np.float32)
         self.d = np.array([-0.05, -0.01, 0, 0], dtype=np.float32)
+
+        # Y-axis flip: camera sees Y=0 at top, laser bed uses Y=0 at bottom-left.
+        # Set WORKSPACE_HEIGHT_MM to the physical height of your bed in mm.
+        self.workspace_height_mm = float(os.getenv("WORKSPACE_HEIGHT_MM", "0"))
         
         self.load_calibration()
         
@@ -94,44 +98,50 @@ class CalibrationService:
                     anchor = p.get('anchor', 'center').lower().replace('_', '-')
                     
                     # Aruco corners are always returned in order: TL, TR, BR, BL
+                    # Physical coordinates use Cartesian convention: Y increases upward.
+                    # So 'top' means HIGHER Y value, 'bottom' means LOWER Y value.
                     if anchor == 'center':
                         target_corners = [
-                            [px - half, py - half], # TL
-                            [px + half, py - half], # TR
-                            [px + half, py + half], # BR
-                            [px - half, py + half]  # BL
+                            [px - half, py + half], # TL (left, up)
+                            [px + half, py + half], # TR (right, up)
+                            [px + half, py - half], # BR (right, down)
+                            [px - half, py - half]  # BL (left, down)
                         ]
                     elif anchor in ['top-left', 'tl']:
+                        # anchor point is the top-left corner of the tag
                         target_corners = [
-                            [px, py],           # TL
-                            [px + s, py],       # TR
-                            [px + s, py + s],   # BR
-                            [px, py + s]        # BL
+                            [px,     py    ],  # TL
+                            [px + s, py    ],  # TR
+                            [px + s, py - s],  # BR
+                            [px,     py - s]   # BL
                         ]
                     elif anchor in ['top-right', 'tr']:
+                        # anchor point is the top-right corner of the tag
                         target_corners = [
-                            [px - s, py],       # TL
-                            [px, py],           # TR
-                            [px, py + s],       # BR
-                            [px - s, py + s]    # BL
+                            [px - s, py    ],  # TL
+                            [px,     py    ],  # TR
+                            [px,     py - s],  # BR
+                            [px - s, py - s]   # BL
                         ]
                     elif anchor in ['bottom-right', 'br']:
+                        # anchor point is the bottom-right corner of the tag
                         target_corners = [
-                            [px - s, py - s],   # TL
-                            [px, py - s],       # TR
-                            [px, py],           # BR
-                            [px - s, py]        # BL
+                            [px - s, py + s],  # TL
+                            [px,     py + s],  # TR
+                            [px,     py    ],  # BR
+                            [px - s, py    ]   # BL
                         ]
                     elif anchor in ['bottom-left', 'bl']:
+                        # anchor point is the bottom-left corner of the tag
                         target_corners = [
-                            [px, py - s],       # TL
-                            [px + s, py - s],   # TR
-                            [px + s, py],       # BR
-                            [px, py]            # BL
+                            [px,     py + s],  # TL
+                            [px + s, py + s],  # TR
+                            [px + s, py    ],  # BR
+                            [px,     py    ]   # BL
                         ]
                     else:
                         # Default to center
-                        target_corners = [[px-half, py-half], [px+half, py-half], [px+half, py+half], [px-half, py+half]]
+                        target_corners = [[px-half, py+half], [px+half, py+half], [px+half, py-half], [px-half, py-half]]
                     
                     src_pts.extend(corners)
                     dst_pts.extend(target_corners)
@@ -174,14 +184,19 @@ class CalibrationService:
         return undistorted
 
     def map_pixels_to_mm(self, points_px: np.ndarray) -> np.ndarray:
-        """Transform pixel coordinates to physical mm."""
+        """Transform pixel coordinates to physical mm using the calibration homography.
+        
+        The homography already encodes the full coordinate transform (including
+        Y-axis orientation) because the calibration destination points are
+        provided by the user in their physical coordinate system.
+        """
         if self.homography_matrix is None:
             return points_px # No calibration
             
         # points_px should be shape (N, 2)
         pts = points_px.reshape(-1, 1, 2).astype(np.float32)
-        transformed = cv2.perspectiveTransform(pts, self.homography_matrix)
-        return transformed.reshape(-1, 2)
+        transformed = cv2.perspectiveTransform(pts, self.homography_matrix).reshape(-1, 2)
+        return transformed
 
     def get_undistorted_view(self, image: np.ndarray, size_mm: Tuple[int, int] = (500, 500)) -> np.ndarray:
         """Returns a de-warped top-down view of the workspace."""

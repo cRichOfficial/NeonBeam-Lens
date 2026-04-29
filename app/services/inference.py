@@ -467,11 +467,19 @@ class InferenceService:
         # Draw final detections on debug image
         for wp in results:
             pts = np.array(wp['corners_px'], dtype=np.int32)
+            mm_pts = wp['corners_mm']
             cv2.polylines(debug_img, [pts], True, (0, 255, 0), 2)
             
+            # Label the ID at the top
             label = f"{wp['id']}"
             cv2.putText(debug_img, label, (pts[0][0], pts[0][1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+            # Label each individual corner with its physical (X, Y)
+            for i, (px, mm) in enumerate(zip(pts, mm_pts)):
+                mm_label = f"({int(mm[0])},{int(mm[1])})"
+                cv2.putText(debug_img, mm_label, (px[0], px[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
         # Save debug image
         debug_path = "calibration_data/detect_debug.jpg"
