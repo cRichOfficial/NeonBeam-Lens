@@ -305,90 +305,95 @@ class InferenceService:
         OpenCV-based fallback detector optimized for a black honeycomb laser bed.
 
         Uses local background subtraction to handle uneven illumination caused by
-        the wood table reflecting through the honeycomb holes. By estimating the
-        'ambient' light level with a very large Gaussian blur and subtracting it
-        from the enhanced image, the gradual reflection gradient cancels out and
-        only solid objects (coasters) that differ sharply from their surroundings
-        are kept.
+        the wood table reflecting through the honeycomb holes. All spatial kernel
+        sizes are scaled proportionally to the image resolution so the detector
+        works correctly at any capture resolution (720p → 4K+).
         """
         orig_h, orig_w = image.shape[:2]
+
+        # ── Resolution-aware scale factor ─────────────────────────────────────
+        # All kernels were originally tuned at 1280×720 (short side = 720px).
+        # Scale every spatial parameter by how much larger the current image is.
+        ref_dim = 720.0
+        scale = min(orig_h, orig_w) / ref_dim
+
+        def odd(n: int) -> int:
+            """Return n rounded up to the nearest odd integer (required for Gaussian kernels)."""
+            n = max(3, int(n))
+            return n if n % 2 == 1 else n + 1
+
+        # Fine blur: removes honeycomb dot texture (~11px at 720p)
+        fine_k = odd(11 * scale)
+        # Coarse blur: estimates ambient illumination field (~101px at 720p).
+        # Must be LARGER than the biggest workpiece so the workpiece "disappears"
+        # into the background estimate and the diff only shows its edges/body.
+        coarse_k = odd(101 * scale)
+        # Morphological close kernel: bridges gaps within a workpiece (~25px at 720p)
+        morph_k = odd(self.honeycomb_kernel * scale)
+        # AprilTag mask expansion (~30px at 720p)
+        tag_pad = int(self.apriltag_mask_padding * scale)
+        # Minimum contour area scales as scale² (area is 2-D)
+        min_area_px = max(500, int(1000 * scale * scale))
+
+        logger.debug(f"Resolution scale={scale:.2f}: fine_k={fine_k}, coarse_k={coarse_k}, morph_k={morph_k}")
 
         # 1. Convert to grayscale — captures both light and dark objects uniformly
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # 2. CLAHE — boost local contrast so dark objects (slate) stand out from
-        #    the dark honeycomb bed before we do any global operations
+        # 2. CLAHE — boost local contrast so dark objects (slate) stand out
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
 
-        # 3. Fine blur — smooths the honeycomb dot texture without losing object edges
-        fine_blur = cv2.GaussianBlur(enhanced, (11, 11), 0)
+        # 3. Fine blur — smooths honeycomb dot texture without losing object edges
+        fine_blur = cv2.GaussianBlur(enhanced, (fine_k, fine_k), 0)
 
         # 4. Coarse blur — estimates the ambient illumination field.
-        #    This kernel must be MUCH larger than the largest workpiece so that
-        #    the coaster itself averages into the background estimate.
-        #    At ~100px (≈10% of frame width) it captures the slow reflection
-        #    gradient while the 100mm coaster (~140px wide) does not disappear.
-        coarse_blur = cv2.GaussianBlur(enhanced, (101, 101), 0)
+        #    The slow table-reflection gradient is captured here and cancels out.
+        coarse_blur = cv2.GaussianBlur(enhanced, (coarse_k, coarse_k), 0)
 
-        # 5. Background-subtracted image.
-        #    Pixels on a solid object deviate from their local background average,
-        #    so they appear bright in the diff image regardless of absolute brightness.
-        #    The smooth table reflection gradient divides out to near-zero.
+        # 5. Background-subtracted image: solid objects deviate from local average
         diff = cv2.absdiff(fine_blur, coarse_blur)
-
-        # 6. Normalise to use the full 0-255 range, then threshold
         diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
         _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
 
-        # 4. Mask out everything outside the detected AprilTags (ROI Locking)
-        # This prevents detection of aluminum rails and distorted edge artifacts.
+        # 6. ROI Locking — mask everything outside the detected AprilTag convex hull
         from .calibration import calibration_service
         tags = calibration_service.detect_tags(image)
-        
+
         mask_roi = np.zeros_like(thresh)
         if len(tags) >= 3:
-            # Create a convex hull of all tag corners to define the active workspace
             all_tag_pts = np.vstack([np.array(t['corners'], dtype=np.int32) for t in tags])
             hull = cv2.convexHull(all_tag_pts)
             cv2.fillPoly(mask_roi, [hull], 255)
         else:
-            # Fallback to a safe center margin if tags aren't visible
-            margin = 80
+            margin = int(80 * scale)
             mask_roi[margin:-margin, margin:-margin] = 255
-            
+
         thresh = cv2.bitwise_and(thresh, mask_roi)
 
-        # 5. Mask out the tags AND their surrounding white paper backing.
-        # We expand each tag polygon outward from its centroid by apriltag_mask_padding
-        # pixels so the white paper square they're printed on is also excluded.
-        pad = self.apriltag_mask_padding
+        # 7. Mask out AprilTags + their white paper backing (scaled padding)
         for tag in tags:
             corners = np.array(tag['corners'], dtype=np.float32)
             centroid = corners.mean(axis=0)
-            # Scale each corner outward from the centroid
-            expanded = centroid + (corners - centroid) * (1.0 + pad / max(
+            expanded = centroid + (corners - centroid) * (1.0 + tag_pad / max(
                 np.linalg.norm(corners - centroid, axis=1).max(), 1.0
             ))
             cv2.fillPoly(thresh, [expanded.astype(np.int32)], 0)
 
-        # 6. Morphological Closing to bridge gaps within workpieces.
-        # Tune HONEYCOMB_KERNEL_SIZE in .env (smaller = tighter bounding boxes).
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (self.honeycomb_kernel, self.honeycomb_kernel))
+        # 8. Morphological Closing — bridges gaps within workpieces
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_k, morph_k))
         closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
         dilated = cv2.dilate(closed, kernel, iterations=1)
 
-        # Find outermost contours
+        # 9. Find outermost contours
         contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         detections = []
         for cnt in contours:
             area_px = cv2.contourArea(cnt)
-            # Filter out tiny noise and the massive frame around the edge of the bed
-            if area_px < 1000 or area_px > (orig_w * orig_h * 0.5):
+            if area_px < min_area_px or area_px > (orig_w * orig_h * 0.5):
                 continue
 
-            # Build binary mask from contour
             mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
             cv2.drawContours(mask, [cnt], -1, 1, thickness=cv2.FILLED)
 
@@ -397,7 +402,7 @@ class InferenceService:
                 "_box": [x, y, x + w, y + h],
                 "_mask": mask,
                 "_confidence": 1.0,
-                "_class_id": -1,  # software fallback — no class
+                "_class_id": -1,
             })
 
         return self._build_workpiece_list(detections, orig_h, orig_w)
