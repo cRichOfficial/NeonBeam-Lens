@@ -105,6 +105,7 @@ WorkingDirectory=$CURRENT_DIR
 ExecStart=$CURRENT_DIR/start_lens.sh
 Restart=always
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-$CURRENT_DIR/.env
 
 [Install]
 WantedBy=multi-user.target

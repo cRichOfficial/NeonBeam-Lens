@@ -10,6 +10,12 @@ if [ -d ".venv" ]; then
     source .venv/bin/activate
 fi
 
+# Source .env file if it exists
+if [ -f ".env" ]; then
+    # Filter out comments and export variables
+    export $(grep -v '^#' .env | xargs)
+fi
+
 # Set default environment variables if not already set
 export USE_HAILO=${USE_HAILO:-True}
 export VISION_CAMERA_ID=${VISION_CAMERA_ID:-0}
