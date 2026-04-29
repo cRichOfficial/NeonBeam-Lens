@@ -1,11 +1,12 @@
 fastapi>=0.103.0
 uvicorn[standard]>=0.23.2
 opencv-contrib-python-headless>=4.8.0.76
-numpy>=1.24.0
+numpy>=1.24.0,<2.0.0
 Pillow>=10.0.0
 python-multipart>=0.0.6
 zeroconf>=0.132.0
-
+contextlib2
+future
 # Testing dependencies
 pytest>=7.4.2
 httpx>=0.25.0
