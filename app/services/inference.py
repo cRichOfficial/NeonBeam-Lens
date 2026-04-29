@@ -448,15 +448,33 @@ class InferenceService:
         from .calibration import calibration_service
         image = calibration_service.undistort(image)
 
+        # Prepare debug drawing
+        debug_img = image.copy()
+
         if self.use_hailo:
             results = self._run_hailo_inference(image)
             # If NPU found nothing confident, try software fallback
             if not results:
                 logger.info("Hailo NPU found no objects. Falling back to software detection...")
-                return self._software_detect(image)
-            return results
+                results = self._software_detect(image)
         else:
-            return self._software_detect(image)
+            results = self._software_detect(image)
+
+        # Draw final detections on debug image
+        for wp in results:
+            pts = np.array(wp['corners_px'], dtype=np.int32)
+            cv2.polylines(debug_img, [pts], True, (0, 255, 0), 2)
+            
+            label = f"{wp['id']}"
+            cv2.putText(debug_img, label, (pts[0][0], pts[0][1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        # Save debug image
+        debug_path = "calibration_data/detect_debug.jpg"
+        os.makedirs(os.path.dirname(debug_path), exist_ok=True)
+        cv2.imwrite(debug_path, debug_img)
+
+        return results
 
 
 # Global instance

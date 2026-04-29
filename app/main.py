@@ -106,6 +106,14 @@ async def get_calibration_debug_image():
         raise HTTPException(status_code=404, detail="Debug image not found. Run /api/lens/calibration/check first.")
     return FileResponse(debug_path, media_type="image/jpeg")
 
+@app.get("/api/lens/detect/debug-image")
+async def get_detect_debug_image():
+    """Returns the visual debug image from the last object detection run."""
+    debug_path = "calibration_data/detect_debug.jpg"
+    if not os.path.exists(debug_path):
+        raise HTTPException(status_code=404, detail="Detection debug image not found. Run /api/lens/detect first.")
+    return FileResponse(debug_path, media_type="image/jpeg")
+
 @app.post("/api/lens/calibrate")
 async def calibrate(request: CalibrationRequest):
     frame = camera_service.get_frame()
@@ -152,7 +160,11 @@ async def detect_objects():
         return {"status": "error", "message": "Camera offline"}
     
     workpieces = inference_service.detect_workpieces(frame)
-    return {"status": "ok", "workpieces": workpieces}
+    return {
+        "status": "ok", 
+        "workpieces": workpieces,
+        "debug_image_url": "/api/lens/detect/debug-image"
+    }
 
 @app.post("/api/lens/transform")
 async def calculate_transform(
