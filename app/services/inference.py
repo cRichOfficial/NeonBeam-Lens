@@ -299,30 +299,48 @@ class InferenceService:
 
     def _software_detect(self, image: np.ndarray) -> List[Dict]:
         """
-        OpenCV-based fallback detector optimised for a black honeycomb laser bed.
-        Uses CLAHE and Adaptive Thresholding to isolate workpieces.
+        OpenCV-based fallback detector optimized for a black honeycomb laser bed.
+        Uses Red-channel analysis and heavy morphological closing to bridge gaps.
         """
         orig_h, orig_w = image.shape[:2]
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # 1. Enhance contrast (helps separate dark slate coasters from dark bed)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-
-        # 2. Blur to destroy the fine lines of the honeycomb mesh
-        blurred = cv2.GaussianBlur(enhanced, (15, 15), 0)
-
-        # 3. Adaptive thresholding (finds large solid shapes, ignores global lighting gradients)
-        thresh = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY_INV, 51, 5
-        )
-
-        # 4. Fill in holes (like text engraved on the coasters) and smooth edges
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.honeycomb_kernel, self.honeycomb_kernel))
-        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
         
-        # 5. Dilate slightly to ensure the workpiece is one solid continuous blob
+        # 1. Use the Red channel (usually highest contrast for workpieces on these beds)
+        red = image[:, :, 2]
+
+        # 2. Aggressive Blur to merge honeycomb texture into a solid background
+        blurred = cv2.GaussianBlur(red, (21, 21), 0)
+
+        # 3. Otsu's Binarization to find the best split between "bed" and "objects"
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # 4. Mask out everything outside the detected AprilTags (ROI Locking)
+        # This prevents detection of aluminum rails and distorted edge artifacts.
+        from .calibration import calibration_service
+        tags = calibration_service.detect_tags(image)
+        
+        mask_roi = np.zeros_like(thresh)
+        if len(tags) >= 3:
+            # Create a convex hull of all tag corners to define the active workspace
+            all_tag_pts = np.vstack([np.array(t['corners'], dtype=np.int32) for t in tags])
+            hull = cv2.convexHull(all_tag_pts)
+            cv2.fillPoly(mask_roi, [hull], 255)
+        else:
+            # Fallback to a safe center margin if tags aren't visible
+            margin = 80
+            mask_roi[margin:-margin, margin:-margin] = 255
+            
+        thresh = cv2.bitwise_and(thresh, mask_roi)
+
+        # 5. Specifically mask out the tags themselves so they aren't detected as objects
+        for tag in tags:
+            pts = np.array(tag['corners'], dtype=np.int32)
+            cv2.fillPoly(thresh, [pts], 0)
+
+        # 6. Heavy Morphological Closing to "glue" fragments into solid coasters
+        # We use a 35px kernel to bridge the dark gaps between engravings
+        kernel_size = max(self.honeycomb_kernel, 35)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
         dilated = cv2.dilate(closed, kernel, iterations=1)
 
         # Find outermost contours
@@ -427,7 +445,12 @@ class InferenceService:
             return []
 
         if self.use_hailo:
-            return self._run_hailo_inference(image)
+            results = self._run_hailo_inference(image)
+            # If NPU found nothing confident, try software fallback
+            if not results:
+                logger.info("Hailo NPU found no objects. Falling back to software detection...")
+                return self._software_detect(image)
+            return results
         else:
             return self._software_detect(image)
 

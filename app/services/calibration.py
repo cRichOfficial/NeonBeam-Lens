@@ -136,7 +136,9 @@ class CalibrationService:
         src_pts = np.array(src_pts, dtype=np.float32)
         dst_pts = np.array(dst_pts, dtype=np.float32)
         
-        matrix, status = cv2.findHomography(src_pts, dst_pts)
+        # Use RANSAC to filter out noisy tag detections
+        matrix, status = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        
         if matrix is not None:
             calib_data = {
                 "detected_tags": detected_tags,
