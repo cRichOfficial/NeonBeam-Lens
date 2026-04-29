@@ -303,22 +303,40 @@ class InferenceService:
     def _software_detect(self, image: np.ndarray) -> List[Dict]:
         """
         OpenCV-based fallback detector optimized for a black honeycomb laser bed.
-        Uses CLAHE-enhanced Red channel and heavy morphological closing.
+        Uses a dual-threshold strategy to handle both dark and light workpieces
+        under uneven illumination (e.g. wood table reflection through honeycomb holes).
         """
         orig_h, orig_w = image.shape[:2]
-        
-        # 1. Use the Red channel
+
+        # 1. Use the Red channel (best contrast in IR-lit environments)
         red = image[:, :, 2]
 
-        # 2. Enhance contrast to find dark slate on dark bed
-        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8,8))
+        # 2. CLAHE contrast enhancement on a local tile basis.
+        #    tileGridSize controls tile size — smaller tiles = more local contrast.
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16, 16))
         enhanced = clahe.apply(red)
 
-        # 3. Aggressive Blur to merge honeycomb texture
-        blurred = cv2.GaussianBlur(enhanced, (15, 15), 0)
+        # 3. Gentle blur to reduce honeycomb dot texture without losing object edges
+        blurred = cv2.GaussianBlur(enhanced, (11, 11), 0)
 
-        # 4. Otsu's Binarization
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 4a. Adaptive threshold — handles uneven illumination (e.g. table reflection)
+        #     Block size must be odd; 151px covers a large enough area to normalise
+        #     the reflection gradient while still responding to object boundaries.
+        adaptive = cv2.adaptiveThreshold(
+            blurred, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=151,
+            C=-10   # negative C = keep pixels brighter than local mean
+        )
+
+        # 4b. Fixed high-value threshold — explicitly catches very bright/light
+        #     objects (e.g. white wood coaster) that may be washed out by the
+        #     adaptive step if the local neighbourhood is also bright.
+        _, bright = cv2.threshold(blurred, 180, 255, cv2.THRESH_BINARY)
+
+        # 4c. Combine both passes — any pixel found by either method is kept
+        thresh = cv2.bitwise_or(adaptive, bright)
 
         # 4. Mask out everything outside the detected AprilTags (ROI Locking)
         # This prevents detection of aluminum rails and distorted edge artifacts.
