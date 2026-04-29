@@ -18,7 +18,8 @@ sudo apt-get install -y \
     libxext6 \
     libxrender1 \
     libv4l-dev \
-    v4l-utils
+    v4l-utils \
+    python3-hailort
 
 # 2. Create virtual environment
 echo "[2/4] Creating virtual environment (.venv)..."
