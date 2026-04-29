@@ -52,10 +52,15 @@ $TARGET_PY -m venv .venv --system-site-packages
 echo "Created .venv with $TARGET_PY and --system-site-packages."
 
 # 3. Install Python dependencies
-echo "[3/5] Installing Python requirements (ignoring system packages to prevent conflicts)..."
+echo "[3/5] Installing Python requirements..."
 source .venv/bin/activate
 pip install --upgrade pip
-pip install --ignore-installed -r requirements.txt
+
+# Upgrade typing_extensions first to bypass the broken Debian package issue
+pip install --upgrade typing_extensions
+
+# Install the rest normally so it can inherit pre-compiled system packages like numpy
+pip install -r requirements.txt
 
 # 4. Create necessary directories
 echo "[4/5] Creating data directories..."
