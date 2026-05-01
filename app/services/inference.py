@@ -304,63 +304,68 @@ class InferenceService:
         """
         OpenCV-based fallback detector optimized for a black honeycomb laser bed.
 
-        Uses local background subtraction to handle uneven illumination caused by
-        the wood table reflecting through the honeycomb holes. All spatial kernel
-        sizes are scaled proportionally to the image resolution so the detector
-        works correctly at any capture resolution (720p → 4K+).
+        Uses morphological Top-Hat transforms to reliably find objects (bright or
+        dark) regardless of their size relative to the blur kernel. All spatial
+        parameters scale with resolution so the detector works at any capture
+        resolution (720p to 12MP+).
+
+        Why Top-Hat instead of Gaussian background subtraction:
+          The previous approach used absdiff(fine_blur, coarse_blur). This only
+          works if the coarse_blur sigma is larger than the object. At 12MP the
+          coarse kernel sigma is only ~64px, but the wood tile can be 400-500px
+          wide — so the coarse blur tracks the object itself, producing near-zero
+          diff at exactly the workpiece location.
+
+          White Top-Hat  = src − open(src)  → bright objects on dark background
+          Black Top-Hat  = close(src) − src → dark objects on bright background
+          Both are independent of absolute brightness and robust to any object size
+          as long as the structuring element is tuned to the honeycomb texture size.
         """
         orig_h, orig_w = image.shape[:2]
 
         # ── Resolution-aware scale factor ─────────────────────────────────────
-        # All kernels were originally tuned at 1280×720 (short side = 720px).
-        # Scale every spatial parameter by how much larger the current image is.
         ref_dim = 720.0
         scale = min(orig_h, orig_w) / ref_dim
 
         def odd(n: int) -> int:
-            """Return n rounded up to the nearest odd integer (required for Gaussian kernels)."""
             n = max(3, int(n))
             return n if n % 2 == 1 else n + 1
 
-        # Fine blur: removes honeycomb dot texture (~11px at 720p)
-        fine_k = odd(11 * scale)
-        # Coarse blur: estimates ambient illumination field (~101px at 720p).
-        # Must be LARGER than the biggest workpiece so the workpiece "disappears"
-        # into the background estimate and the diff only shows its edges/body.
-        coarse_k = odd(101 * scale)
-        # Morphological close kernel: bridges gaps within a workpiece (~25px at 720p)
+        # Smooth kernel: removes the fine honeycomb hole texture before Top-Hat
+        smooth_k = odd(11 * scale)
+        # Top-Hat structuring element: defines what counts as "local background".
+        # Must be LARGER than honeycomb holes but SMALLER than a workpiece.
+        # At 720p ~45px ≈ 6mm on a 400mm bed.
+        tophat_k = odd(45 * scale)
+        # Morphological close kernel: bridges gaps within a workpiece
         morph_k = odd(self.honeycomb_kernel * scale)
-        # AprilTag mask expansion (~30px at 720p)
+        # AprilTag mask expansion
         tag_pad = int(self.apriltag_mask_padding * scale)
-        # Minimum contour area scales as scale² (area is 2-D)
+        # Minimum contour area scales as scale²
         min_area_px = max(500, int(1000 * scale * scale))
 
-        logger.debug(f"Resolution scale={scale:.2f}: fine_k={fine_k}, coarse_k={coarse_k}, morph_k={morph_k}")
+        logger.debug(
+            f"Resolution scale={scale:.2f}: smooth_k={smooth_k}, "
+            f"tophat_k={tophat_k}, morph_k={morph_k}"
+        )
 
-        # 1. Convert to grayscale — captures both light and dark objects uniformly
+        # 1. Grayscale
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # 2. CLAHE — boost local contrast so dark objects (slate) stand out
+        # 2. CLAHE — boost local contrast
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
 
-        # 3. Fine blur — smooths honeycomb dot texture without losing object edges
-        fine_blur = cv2.GaussianBlur(enhanced, (fine_k, fine_k), 0)
+        # 3. Smooth away honeycomb dot texture
+        smoothed = cv2.GaussianBlur(enhanced, (smooth_k, smooth_k), 0)
 
-        # 4. Coarse blur — estimates the ambient illumination field.
-        #    The slow table-reflection gradient is captured here and cancels out.
-        coarse_blur = cv2.GaussianBlur(enhanced, (coarse_k, coarse_k), 0)
-
-        # 5. Background-subtracted image: solid objects deviate from local average
-        diff = cv2.absdiff(fine_blur, coarse_blur)
-        diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
-        _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-
-        # 6. ROI Locking — mask everything outside the detected AprilTag convex hull
+        # 4. Build ROI mask from AprilTag hull FIRST, before any normalization,
+        #    so the aluminum frame and surrounding table cannot compress the
+        #    in-bed contrast range.
         from .calibration import calibration_service
         tags = calibration_service.detect_tags(image)
 
-        mask_roi = np.zeros_like(thresh)
+        mask_roi = np.zeros(smoothed.shape, dtype=np.uint8)
         if len(tags) >= 3:
             all_tag_pts = np.vstack([np.array(t['corners'], dtype=np.int32) for t in tags])
             hull = cv2.convexHull(all_tag_pts)
@@ -369,24 +374,49 @@ class InferenceService:
             margin = int(80 * scale)
             mask_roi[margin:-margin, margin:-margin] = 255
 
-        thresh = cv2.bitwise_and(thresh, mask_roi)
-
-        # 7. Mask out AprilTags + their white paper backing (scaled padding)
+        # 5. Mask out AprilTag squares + white paper backing
         for tag in tags:
             corners = np.array(tag['corners'], dtype=np.float32)
             centroid = corners.mean(axis=0)
-            expanded = centroid + (corners - centroid) * (1.0 + tag_pad / max(
+            scale_f = 1.0 + tag_pad / max(
                 np.linalg.norm(corners - centroid, axis=1).max(), 1.0
-            ))
-            cv2.fillPoly(thresh, [expanded.astype(np.int32)], 0)
+            )
+            expanded = centroid + (corners - centroid) * scale_f
+            cv2.fillPoly(mask_roi, [expanded.astype(np.int32)], 0)
 
-        # 8. Morphological Closing — bridges gaps within workpieces
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_k, morph_k))
-        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        dilated = cv2.dilate(closed, kernel, iterations=1)
+        # 6. Morphological Top-Hat — finds objects against the honeycomb texture
+        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (tophat_k, tophat_k))
+        white_tophat = cv2.morphologyEx(smoothed, cv2.MORPH_TOPHAT,  se)  # bright on dark
+        black_tophat = cv2.morphologyEx(smoothed, cv2.MORPH_BLACKHAT, se)  # dark on bright
+        combined = cv2.add(white_tophat, black_tophat)
+
+        # 7. Restrict to ROI before normalising so outside-bed regions don't
+        #    dominate the value range and wash out the workpiece signal.
+        in_bed = cv2.bitwise_and(combined, combined, mask=mask_roi)
+
+        roi_pixels = in_bed[mask_roi > 0]
+        if len(roi_pixels) == 0 or roi_pixels.max() == 0:
+            logger.warning("No signal detected in bed ROI.")
+            return []
+
+        # Robust normalisation: use the 99th percentile to ignore hot pixels
+        p99 = float(np.percentile(roi_pixels, 99))
+        if p99 > 0:
+            norm = np.clip(in_bed.astype(np.float32) * (255.0 / p99), 0, 255).astype(np.uint8)
+        else:
+            norm = in_bed
+
+        # Threshold: keep pixels in the top ~85% of signal range
+        _, thresh = cv2.threshold(norm, 38, 255, cv2.THRESH_BINARY)
+
+        # 8. Morphological Closing — bridges internal gaps (wood grain, knots)
+        morph_se = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_k, morph_k))
+        closed  = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, morph_se)
+        dilated = cv2.dilate(closed, morph_se, iterations=1)
 
         # 9. Find outermost contours
         contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        logger.debug(f"Raw contour count before area filter: {len(contours)}")
 
         detections = []
         for cnt in contours:
@@ -405,6 +435,7 @@ class InferenceService:
                 "_class_id": -1,
             })
 
+        logger.debug(f"Detections after pixel area filter: {len(detections)}")
         return self._build_workpiece_list(detections, orig_h, orig_w)
 
     # ── Shared post-processing ────────────────────────────────────────────────
