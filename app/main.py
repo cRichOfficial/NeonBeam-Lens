@@ -82,7 +82,7 @@ async def health_check():
     return {
         "status": "ok", 
         "service": "machine_vision",
-        "hailo_npu": inference_service.initialized,
+        "detector": "opencv",
         "camera_active": camera_service.running
     }
 

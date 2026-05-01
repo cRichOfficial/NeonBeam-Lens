@@ -1,330 +1,69 @@
 import os
+import time
 import cv2
 import logging
 import numpy as np
-from typing import List, Dict, Optional, Tuple
-from .calibration import calibration_service
+from typing import List, Dict
 
 logger = logging.getLogger("vision_api.inference")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# YOLOv8-seg post-processing helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
-
-
-def _xywh2xyxy(boxes: np.ndarray) -> np.ndarray:
-    """Convert [cx, cy, w, h] to [x1, y1, x2, y2]."""
-    out = np.copy(boxes)
-    out[:, 0] = boxes[:, 0] - boxes[:, 2] / 2
-    out[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
-    out[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
-    out[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
-    return out
-
-
-def _nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float = 0.45) -> List[int]:
-    """Simple NMS — returns kept indices."""
-    if len(boxes) == 0:
-        return []
-    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    areas = (x2 - x1) * (y2 - y1)
-    order = scores.argsort()[::-1]
-    kept = []
-    while order.size > 0:
-        i = order[0]
-        kept.append(i)
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-        order = order[1:][iou <= iou_threshold]
-    return kept
-
-
-def _decode_yolov8_seg(outputs: Dict[str, np.ndarray], orig_h: int, orig_w: int,
-                        conf_threshold: float = 0.4, iou_threshold: float = 0.45,
-                        model_size: int = 640) -> List[Dict]:
-    """
-    Decode raw un-fused YOLOv8-seg tensors from the Hailo hardware.
-    The hardware returns 10 tensors: 3 scales (80x80, 40x40, 20x20) * 3 branches 
-    (box DFL, class scores, mask coeffs) + 1 prototype mask tensor.
-    """
-    scales = {80: {}, 40: {}, 20: {}}
-    proto_tensor = None
-
-    # Sort tensors by spatial grid size and feature type
-    for name, tensor in outputs.items():
-        t = tensor.squeeze(0)  # Remove batch dim: (H, W, C)
-        h, w, c = t.shape
-        if h == 160 and w == 160 and c == 32:
-            proto_tensor = t.transpose(2, 0, 1)  # Convert to (32, 160, 160) for matmul
-            continue
-            
-        if h in scales:
-            if c == 80:
-                # Sigmoid is usually applied in hardware for class scores, but let's be safe
-                # If values are > 1, it needs sigmoid. Usually hailort normalizes it.
-                scales[h]['cls'] = t 
-            elif c == 64:
-                scales[h]['reg'] = t
-            elif c == 32:
-                scales[h]['mask'] = t
-
-    all_boxes = []
-    all_scores = []
-    all_class_ids = []
-    all_mask_coeffs = []
-
-    dfl_weights = np.arange(16, dtype=np.float32)
-
-    def softmax(x):
-        e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
-        return e_x / e_x.sum(axis=-1, keepdims=True)
-
-    for grid_size, tensors in scales.items():
-        if 'cls' not in tensors or 'reg' not in tensors:
-            continue
-            
-        stride = model_size / grid_size
-        cls_t = tensors['cls']
-        reg_t = tensors['reg']
-        mask_t = tensors.get('mask')
-
-        # Find anchors exceeding confidence threshold
-        max_scores = np.max(cls_t, axis=-1)
-        # Apply sigmoid if hardware didn't (Hailo usually outputs logits if un-fused)
-        if np.max(max_scores) > 1.0 or np.min(max_scores) < 0.0:
-            max_scores = _sigmoid(max_scores)
-            cls_t = _sigmoid(cls_t)
-
-        logger.info(f"Scale {grid_size}x{grid_size}: Absolute highest confidence score is {float(np.max(max_scores)):.4f}")
-
-        valid_mask = max_scores > conf_threshold
-        if not np.any(valid_mask):
-            continue
-
-        y_idx, x_idx = np.where(valid_mask)
-        scores = max_scores[valid_mask]
-        class_ids = np.argmax(cls_t[valid_mask], axis=-1)
-        
-        reg_features = reg_t[valid_mask].reshape(-1, 4, 16)
-        mask_coeffs = mask_t[valid_mask] if mask_t is not None else np.zeros((len(scores), 32))
-
-        # Decode DFL (Distribution Focal Loss)
-        dist = softmax(reg_features)
-        pred_dist = np.sum(dist * dfl_weights, axis=-1)
-
-        anchor_x = (x_idx + 0.5) * stride
-        anchor_y = (y_idx + 0.5) * stride
-
-        x1 = anchor_x - pred_dist[:, 0] * stride
-        y1 = anchor_y - pred_dist[:, 1] * stride
-        x2 = anchor_x + pred_dist[:, 2] * stride
-        y2 = anchor_y + pred_dist[:, 3] * stride
-
-        boxes = np.stack([x1, y1, x2, y2], axis=-1)
-
-        logger.info(f"Scale {grid_size}x{grid_size}: {len(scores)} anchors passed confidence > {conf_threshold}")
-
-        all_boxes.append(boxes)
-        all_scores.append(scores)
-        all_class_ids.append(class_ids)
-        all_mask_coeffs.append(mask_coeffs)
-
-    if not all_boxes:
-        logger.warning("No anchors passed confidence threshold across all scales.")
-        return []
-
-    boxes = np.concatenate(all_boxes, axis=0)
-    scores = np.concatenate(all_scores, axis=0)
-    class_ids = np.concatenate(all_class_ids, axis=0)
-    mask_coeffs = np.concatenate(all_mask_coeffs, axis=0)
-    
-    logger.info(f"Total raw detections before NMS: {len(boxes)}")
-
-    # Scale to original image
-    scale_x = orig_w / model_size
-    scale_y = orig_h / model_size
-    boxes[:, [0, 2]] *= scale_x
-    boxes[:, [1, 3]] *= scale_y
-    boxes = np.clip(boxes, 0, [[orig_w, orig_h, orig_w, orig_h]])
-
-    # NMS
-    kept = _nms(boxes, scores, iou_threshold)
-    logger.info(f"Total detections after NMS: {len(kept)}")
-    
-    results = []
-
-    for idx in kept:
-        x1, y1, x2, y2 = boxes[idx].astype(int)
-
-        if proto_tensor is not None:
-            # Mask generation: dot product of coefficients with prototype masks
-            ph, pw = proto_tensor.shape[1], proto_tensor.shape[2]
-            mask_logits = (mask_coeffs[idx] @ proto_tensor.reshape(32, -1)).reshape(ph, pw)
-            instance_mask = (_sigmoid(mask_logits) > 0.5).astype(np.uint8)
-            instance_mask = cv2.resize(instance_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-        else:
-            instance_mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
-            instance_mask[y1:y2, x1:x2] = 1
-
-        results.append({
-            "_box": [x1, y1, x2, y2],
-            "_mask": instance_mask,
-            "_confidence": float(scores[idx]),
-            "_class_id": int(class_ids[idx]),
-        })
-
-    return results
-
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Inference Service
+# Detection Service
 # ──────────────────────────────────────────────────────────────────────────────
 
 class InferenceService:
+    """
+    OpenCV-based workpiece detector for a black honeycomb laser bed.
+
+    Detection strategy: **Local texture variance.**
+    The honeycomb bed has a distinctive repeating hole pattern which produces
+    high local pixel variance.  Any solid workpiece (wood, slate, acrylic,
+    card, metal) placed on it has significantly *lower* local variance because
+    it is a continuous surface.  By thresholding on low-variance regions inside
+    the AprilTag-bounded ROI, we detect objects of *any* brightness — bright
+    wood and dark slate alike.
+
+    All expensive processing runs on a downsampled working image (capped at
+    DETECT_MAX_DIM px on the long side).  Contour coordinates are scaled back
+    to full resolution before the calibration homography maps them to physical
+    mm values.
+    """
+
     def __init__(self):
-        self.use_hailo = os.getenv("USE_HAILO", "False").lower() == "true"
-        self.model_path = os.getenv("MODEL_PATH", "app/models/yolov8s_seg.hef")
-        self.conf_threshold = float(os.getenv("DETECT_CONF_THRESHOLD", "0.4"))
         self.min_area_mm2 = float(os.getenv("MIN_WORKPIECE_AREA_MM2", "500"))
         self.max_area_mm2 = float(os.getenv("MAX_WORKPIECE_AREA_MM2", "160000"))
         self.honeycomb_kernel = int(os.getenv("HONEYCOMB_KERNEL_SIZE", "25"))
-        # Extra pixels to expand the AprilTag mask beyond the tag boundary,
-        # to cover the white paper backing the tag is printed on.
         self.apriltag_mask_padding = int(os.getenv("APRILTAG_MASK_PADDING", "30"))
-        self.model_input_size = 640
+        self.variance_window = int(os.getenv("DETECT_VARIANCE_WINDOW", "25"))
+        self.initialized = True
+        logger.info("InferenceService initialised (OpenCV texture-variance detector).")
 
-        self.vdevice = None
-        self.network_group = None
-        self.input_vstream_infos = None
-        self.output_vstream_infos = None
-        self.initialized = False
+    # ── Helpers ────────────────────────────────────────────────────────────────
 
-        if self.use_hailo:
-            self._init_hailo()
-        else:
-            logger.info("USE_HAILO=False — using OpenCV software detection fallback.")
-            self.initialized = True
+    @staticmethod
+    def _odd(n: int) -> int:
+        """Round to the nearest odd integer ≥ 3 (required for OpenCV kernels)."""
+        n = max(3, int(n))
+        return n if n % 2 == 1 else n + 1
 
-    # ── Hailo Initialization ──────────────────────────────────────────────────
+    # ── Core Detection ─────────────────────────────────────────────────────────
 
-    def _init_hailo(self):
-        """Initialize Hailo-8L NPU via hailort Python API."""
-        import sys
-        if "/usr/lib/python3/dist-packages" not in sys.path:
-            sys.path.append("/usr/lib/python3/dist-packages")
-
-        try:
-            try:
-                import hailort
-            except ImportError:
-                # The Debian apt package exposes VDevice at the root of hailo_platform
-                import hailo_platform as hailort
-
-            logger.info(f"Loading Hailo HEF from {self.model_path}")
-
-            if not os.path.exists(self.model_path):
-                raise FileNotFoundError(
-                    f"HEF not found at '{self.model_path}'. "
-                    f"Run setup_native.sh to install the model. See app/models/README.md."
-                )
-
-            self.vdevice = hailort.VDevice()
-            hef = hailort.HEF(self.model_path)
-            configured = self.vdevice.configure(hef)
-            self.network_group = configured[0]
-            self.input_vstream_infos = hef.get_input_vstream_infos()
-            self.output_vstream_infos = hef.get_output_vstream_infos()
-            self.initialized = True
-            logger.info("Hailo NPU initialized successfully.")
-
-        except ImportError as e:
-            raise ImportError(
-                f"hailort Python package not found ({e}). "
-                "Install HailoRT Python bindings (.whl) from the Hailo Developer Zone."
-            )
-        except FileNotFoundError as e:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize Hailo NPU: {e}")
-
-    # ── Hailo Inference ───────────────────────────────────────────────────────
-
-    def _run_hailo_inference(self, image: np.ndarray) -> List[Dict]:
-        """Run YOLOv8-seg on the Hailo NPU and return raw pre-mapped detections."""
-        import sys
-        if "/usr/lib/python3/dist-packages" not in sys.path:
-            sys.path.append("/usr/lib/python3/dist-packages")
-        
-        try:
-            import hailort
-        except ImportError:
-            import hailo_platform as hailort
-
-        orig_h, orig_w = image.shape[:2]
-        size = self.model_input_size
-
-        # Preprocess: resize to 640×640, ensure uint8 RGB
-        input_img = cv2.resize(image, (size, size))
-        if len(input_img.shape) == 2:
-            input_img = cv2.cvtColor(input_img, cv2.COLOR_GRAY2RGB)
-        elif input_img.shape[2] == 4:
-            input_img = cv2.cvtColor(input_img, cv2.COLOR_BGRA2RGB)
-        else:
-            input_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
-        input_img = input_img.astype(np.uint8)
-
-        input_params = hailort.InputVStreamParams.make_from_network_group(
-            self.network_group, quantized=False, format_type=hailort.FormatType.UINT8
-        )
-        output_params = hailort.OutputVStreamParams.make_from_network_group(
-            self.network_group, quantized=False, format_type=hailort.FormatType.FLOAT32
-        )
-
-        network_group_params = self.network_group.create_params()
-        with self.network_group.activate(network_group_params):
-            with hailort.InferVStreams(self.network_group, input_params, output_params) as pipeline:
-                input_data = {self.input_vstream_infos[0].name: np.expand_dims(input_img, 0)}
-                raw_outputs = pipeline.infer(input_data)
-
-        detections = _decode_yolov8_seg(
-            raw_outputs, orig_h, orig_w,
-            conf_threshold=self.conf_threshold,
-            model_size=size,
-        )
-        return self._build_workpiece_list(detections, orig_h, orig_w)
-
-    def _software_detect(self, image: np.ndarray) -> List[Dict]:
+    def _detect_objects(self, image: np.ndarray) -> List[Dict]:
         """
-        OpenCV-based fallback detector for a black honeycomb laser bed.
+        Detect workpieces on a honeycomb laser bed using local texture variance.
 
-        Detection strategy: the honeycomb background is always very dark.
-        We estimate the background brightness from the 30th percentile of
-        in-bed pixels (the dark honeycomb dominates the distribution even
-        with a large workpiece present) and threshold anything significantly
-        brighter as a candidate workpiece.
-
-        Performance: all expensive operations run on a downsampled working
-        image (capped at DETECT_MAX_DIM on the long side, default 1280px).
-        Contour coordinates are scaled back to full resolution before the
-        homography maps them to physical mm values.
+        Returns a list of workpiece dicts (see `detect_workpieces` for schema).
+        `image` must already be undistorted if FISHEYE_LENS is enabled.
         """
         orig_h, orig_w = image.shape[:2]
+        t0 = time.monotonic()
 
-        # ── Downsample to a capped working resolution ────────────────────────
-        # Morphological ops scale as O(H × W × k²). At 12MP with a large kernel
-        # this takes minutes. Capping at 1280px long-side cuts that to <1s while
-        # retaining ample detail for workpiece boundary detection.
-        DETECT_MAX_DIM = int(os.getenv("DETECT_MAX_DIM", "1280"))
+        # ── 1. Downsample to capped working resolution ───────────────────────
+        max_dim = int(os.getenv("DETECT_MAX_DIM", "1280"))
         long_side = max(orig_h, orig_w)
-        if long_side > DETECT_MAX_DIM:
-            ds = DETECT_MAX_DIM / long_side
+        if long_side > max_dim:
+            ds = max_dim / long_side
             proc_w = int(orig_w * ds)
             proc_h = int(orig_h * ds)
             proc = cv2.resize(image, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
@@ -334,161 +73,151 @@ class InferenceService:
             proc = image
 
         logger.debug(
-            f"Detection working res: {proc_w}x{proc_h} "
-            f"(ds={ds:.3f} from {orig_w}x{orig_h})"
+            f"Working res: {proc_w}×{proc_h} "
+            f"(ds={ds:.3f} from {orig_w}×{orig_h})"
         )
 
-        # ── Resolution-aware kernel sizes (tuned at 720p reference) ──────────
+        # ── 2. Preprocess ────────────────────────────────────────────────────
         ref_dim = 720.0
         scale = min(proc_h, proc_w) / ref_dim
 
-        def odd(n: int) -> int:
-            n = max(3, int(n))
-            return n if n % 2 == 1 else n + 1
+        smooth_k = self._odd(11 * scale)
+        morph_k  = self._odd(self.honeycomb_kernel * scale)
+        var_k    = self._odd(self.variance_window * scale)
+        tag_pad  = int(self.apriltag_mask_padding * scale)
+        min_area = max(100, int(1000 * scale * scale))
 
-        smooth_k    = odd(11 * scale)   # removes honeycomb dot texture
-        morph_k     = odd(self.honeycomb_kernel * scale)
-        tag_pad     = int(self.apriltag_mask_padding * scale)
-        min_area_px = max(100, int(1000 * scale * scale))
-
-        logger.debug(f"Kernels at scale={scale:.2f}: smooth={smooth_k}, morph={morph_k}")
-
-        # 1. Grayscale
         gray = cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY)
 
-        # 2. CLAHE — boost local contrast
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
 
-        # 3. Smooth away honeycomb dot texture
         smoothed = cv2.GaussianBlur(enhanced, (smooth_k, smooth_k), 0)
 
-        # 4. Build ROI mask from AprilTag hull FIRST so that the frame, table,
-        #    and reflections outside the bed don't corrupt the normalisation.
-        #    Detect on the downsampled proc image — fast and coordinates are
-        #    already in proc-space.
+        # ── 3. Build ROI mask from AprilTag convex hull ──────────────────────
+        #    Detect tags on the FULL-res image (ArUco params are tuned for it),
+        #    then scale corner coordinates to proc-space.
         from .calibration import calibration_service
-        tags = calibration_service.detect_tags(proc, apply_undistort=False)
+        tags_full = calibration_service.detect_tags(image, apply_undistort=False)
+        logger.debug(f"AprilTags detected (full-res): {len(tags_full)}")
+
+        tags_proc = []
+        for t in tags_full:
+            scaled = (np.array(t['corners'], dtype=np.float32) * ds).tolist()
+            tags_proc.append({**t, 'corners': scaled})
 
         mask_roi = np.zeros((proc_h, proc_w), dtype=np.uint8)
-        if len(tags) >= 3:
-            all_tag_pts = np.vstack([np.array(t['corners'], dtype=np.int32) for t in tags])
-            hull = cv2.convexHull(all_tag_pts)
+        if len(tags_proc) >= 3:
+            pts = np.vstack([np.array(t['corners'], dtype=np.int32) for t in tags_proc])
+            hull = cv2.convexHull(pts)
             cv2.fillPoly(mask_roi, [hull], 255)
+            roi_px = cv2.countNonZero(mask_roi)
+            logger.debug(
+                f"ROI: {len(tags_proc)}-tag hull, "
+                f"{roi_px} px ({100 * roi_px / (proc_w * proc_h):.1f}% of frame)"
+            )
         else:
             margin = int(80 * scale)
             mask_roi[margin:-margin, margin:-margin] = 255
+            logger.warning(
+                f"Only {len(tags_proc)} tags detected — "
+                f"using margin fallback ROI (margin={margin}px)"
+            )
 
-        # 5. Erase AprilTag squares + white paper backing from the ROI
-        for tag in tags:
+        # Erase AprilTag squares + white paper backing
+        for tag in tags_proc:
             corners = np.array(tag['corners'], dtype=np.float32)
             centroid = corners.mean(axis=0)
-            scale_f = 1.0 + tag_pad / max(
-                np.linalg.norm(corners - centroid, axis=1).max(), 1.0
-            )
-            expanded = centroid + (corners - centroid) * scale_f
+            half_diag = np.linalg.norm(corners - centroid, axis=1).max()
+            expand = 1.0 + tag_pad / max(half_diag, 1.0)
+            expanded = centroid + (corners - centroid) * expand
             cv2.fillPoly(mask_roi, [expanded.astype(np.int32)], 0)
 
-        # 6. Percentile-based background thresholding
+        # ── 4. Local variance — texture-based detection ──────────────────────
+        #    Variance = E[X²] − E[X]²   (two box filters, very fast)
         #
-        #    The honeycomb bed is always dark (post-CLAHE typically 30-80 gray).
-        #    It covers >60% of the ROI even with a large workpiece present,
-        #    so the 30th percentile of in-ROI pixel values gives a stable,
-        #    scene-adaptive background level estimate.
-        #
-        #    Any workpiece (wood, acrylic, card) is significantly brighter.
-        #    We threshold at bg_level + an adaptive margin.
-        in_bed_vals = smoothed[mask_roi > 0]
-        if len(in_bed_vals) == 0:
+        #    Honeycomb → high variance (repeating hole pattern)
+        #    Solid workpiece → low variance (continuous surface)
+        sf = smoothed.astype(np.float32)
+        mean_img = cv2.blur(sf, (var_k, var_k))
+        mean_sq  = cv2.blur(sf * sf, (var_k, var_k))
+        local_var = np.maximum(mean_sq - mean_img * mean_img, 0.0)
+
+        # ── 5. Threshold: low-variance regions inside ROI ────────────────────
+        roi_var = local_var[mask_roi > 0]
+        if len(roi_var) == 0:
             logger.warning("ROI is empty — cannot detect objects.")
             return []
 
-        bg_level = float(np.percentile(in_bed_vals, 30))
-        # Adaptive threshold: bg + max(fixed floor, 30% of bg value)
-        # On a dark bed (bg~50): threshold ~75.  Wood tile is typically 130-200.
-        thresh_val = bg_level + max(25.0, bg_level * 0.3)
-        thresh_val = min(thresh_val, 240.0)  # safety cap
+        # The honeycomb dominates the ROI (>60% of pixels), so its variance
+        # sits around the 60th percentile.
+        hc_baseline = float(np.percentile(roi_var, 60))
+        var_thresh = hc_baseline * 0.4  # solid surfaces are typically <40% of HC
 
         logger.debug(
-            f"BG estimate (p30): {bg_level:.1f}, "
-            f"threshold: {thresh_val:.1f}, "
-            f"ROI max: {float(in_bed_vals.max()):.1f}, "
-            f"ROI mean: {float(in_bed_vals.mean()):.1f}"
+            f"Variance: HC baseline (p60)={hc_baseline:.1f}, "
+            f"threshold={var_thresh:.1f}, "
+            f"ROI var min={float(roi_var.min()):.1f}, "
+            f"ROI var max={float(roi_var.max()):.1f}"
         )
 
-        # Build binary mask: bright pixels inside ROI
-        bright = (smoothed > thresh_val).astype(np.uint8) * 255
-        thresh = cv2.bitwise_and(bright, bright, mask=mask_roi)
+        # Binary mask: low-variance pixels inside the ROI
+        low_var = (local_var < var_thresh).astype(np.uint8) * 255
+        workpiece_mask = cv2.bitwise_and(low_var, low_var, mask=mask_roi)
 
-        # 8. Morphological Closing — bridges intra-workpiece gaps
+        # ── 6. Morphological close + dilate to merge fragments ───────────────
         morph_se = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_k, morph_k))
-        closed  = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, morph_se)
+        closed  = cv2.morphologyEx(workpiece_mask, cv2.MORPH_CLOSE, morph_se)
         dilated = cv2.dilate(closed, morph_se, iterations=1)
 
-        # 9. Find contours at proc resolution
-        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        logger.debug(f"Raw contour count before area filter: {len(contours)}")
+        # ── 7. Find contours (proc-space) ────────────────────────────────────
+        contours, _ = cv2.findContours(
+            dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        logger.debug(f"Contours before area filter: {len(contours)}")
 
-        detections = []
-        for cnt in contours:
-            area_px = cv2.contourArea(cnt)
-            if area_px < min_area_px or area_px > (orig_w * orig_h * 0.5):
-                continue
-
-            mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
-            cv2.drawContours(mask, [cnt], -1, 1, thickness=cv2.FILLED)
-
-            x, y, w, h = cv2.boundingRect(cnt)
-            detections.append({
-                "_box": [x, y, x + w, y + h],
-                "_mask": mask,
-                "_confidence": 1.0,
-                "_class_id": -1,
-            })
-
-        logger.debug(f"Detections after pixel area filter: {len(detections)}")
-        return self._build_workpiece_list(detections, orig_h, orig_w)
-
-    # ── Shared post-processing ────────────────────────────────────────────────
-
-    def _build_workpiece_list(self, detections: List[Dict],
-                               orig_h: int, orig_w: int) -> List[Dict]:
-        """
-        Convert raw detections into the unified workpiece schema.
-        Applies physical-area filtering via the calibration homography.
-        """
+        # ── 8. Build results — scale contours to full-res ────────────────────
         results = []
-        for i, det in enumerate(detections):
-            mask = det["_mask"]
-            x1, y1, x2, y2 = det["_box"]
+        from .calibration import calibration_service as cal
 
-            # Extract contour from mask for oriented box & segmentation polygon
-            contour_pts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contour_pts:
+        for i, cnt in enumerate(contours):
+            area_proc = cv2.contourArea(cnt)
+            if area_proc < min_area or area_proc > (proc_w * proc_h * 0.5):
                 continue
-            cnt = max(contour_pts, key=cv2.contourArea)
+
+            # Scale contour from proc-space → full-res
+            if ds < 1.0:
+                cnt_full = (cnt.astype(np.float64) / ds).astype(np.int32)
+            else:
+                cnt_full = cnt
 
             # Oriented bounding rect → 4 corners + angle
-            rect = cv2.minAreaRect(cnt)
-            corners_px = cv2.boxPoints(rect).astype(int)  # (4, 2)
+            rect = cv2.minAreaRect(cnt_full)
+            corners_px = cv2.boxPoints(rect).astype(np.int32)
             angle_deg = float(rect[2])
 
             # Convex hull as segmentation polygon
-            hull = cv2.convexHull(cnt)
+            hull = cv2.convexHull(cnt_full)
             seg_px = hull.reshape(-1, 2).tolist()
 
+            # Axis-aligned bounding box (full-res pixels)
+            x, y, w, h = cv2.boundingRect(cnt_full)
+
             # Map to physical mm via calibration homography
-            corners_mm = calibration_service.map_pixels_to_mm(
-                corners_px.astype(np.float32)
-            )
-            seg_mm = calibration_service.map_pixels_to_mm(
+            corners_mm = cal.map_pixels_to_mm(corners_px.astype(np.float32))
+            seg_mm = cal.map_pixels_to_mm(
                 np.array(seg_px, dtype=np.float32)
             )
 
             # Physical area filter
-            area_mm2 = float(cv2.contourArea(corners_mm.reshape(-1, 1, 2).astype(np.float32)))
+            area_mm2 = float(
+                cv2.contourArea(corners_mm.reshape(-1, 1, 2).astype(np.float32))
+            )
             if area_mm2 < self.min_area_mm2 or area_mm2 > self.max_area_mm2:
-                logger.debug(f"Filtered detection {i}: area {area_mm2:.0f} mm² out of range")
+                logger.debug(
+                    f"Filtered detection {i}: area {area_mm2:.0f} mm² "
+                    f"out of [{self.min_area_mm2}, {self.max_area_mm2}]"
+                )
                 continue
 
             box_mm = [
@@ -499,11 +228,11 @@ class InferenceService:
             ]
 
             results.append({
-                "id": f"wp_{i:03d}",
+                "id": f"wp_{len(results):03d}",
                 "class": "workpiece",
-                "confidence": det["_confidence"],
+                "confidence": 1.0,
                 "angle_deg": angle_deg,
-                "box_px": [x1, y1, x2, y2],
+                "box_px": [x, y, x + w, y + h],
                 "corners_px": corners_px.tolist(),
                 "segmentation_px": seg_px,
                 "corners_mm": corners_mm.tolist(),
@@ -512,97 +241,98 @@ class InferenceService:
                 "area_mm2": area_mm2,
             })
 
+        elapsed = time.monotonic() - t0
+        logger.info(
+            f"Detection complete: {len(results)} workpiece(s) in {elapsed:.2f}s"
+        )
         return results
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Debug Image ────────────────────────────────────────────────────────────
+
+    def _save_debug_image(
+        self, image: np.ndarray, results: List[Dict], mean_brightness: float
+    ) -> None:
+        """
+        Save a 2-panel diagnostic composite:
+          Panel A (left)  — raw frame with detection overlays
+          Panel B (right) — CLAHE-enhanced grayscale (what the detector sees)
+        """
+        debug_path = "calibration_data/detect_debug.jpg"
+        os.makedirs(os.path.dirname(debug_path), exist_ok=True)
+
+        debug_img = image.copy()
+
+        # Draw detection overlays
+        for wp in results:
+            pts = np.array(wp['corners_px'], dtype=np.int32)
+            cv2.polylines(debug_img, [pts], True, (0, 255, 0), 2)
+
+            cv2.putText(
+                debug_img, wp['id'],
+                (pts[0][0], pts[0][1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
+            )
+
+            for px, mm in zip(pts, wp['corners_mm']):
+                label = f"({int(mm[0])},{int(mm[1])})"
+                cv2.putText(
+                    debug_img, label, (px[0], px[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1
+                )
+
+        # Build composite
+        try:
+            MAX_W = 1280
+            h, w = debug_img.shape[:2]
+            s = min(1.0, MAX_W / w)
+            tw, th = int(w * s), int(h * s)
+
+            panel_a = cv2.resize(debug_img, (tw, th))
+
+            gray = cv2.cvtColor(cv2.resize(image, (tw, th)), cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            panel_b = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+
+            lbl = dict(
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.7,
+                color=(0, 255, 255), thickness=2,
+            )
+            cv2.putText(panel_a, f"RAW  mean={mean_brightness:.0f}", (10, 30), **lbl)
+            cv2.putText(panel_b, "CLAHE gray (detector input)", (10, 30), **lbl)
+
+            cv2.imwrite(debug_path, np.hstack([panel_a, panel_b]))
+        except Exception as e:
+            logger.warning(f"Debug composite failed: {e}")
+            cv2.imwrite(debug_path, debug_img)
+
+    # ── Public API ─────────────────────────────────────────────────────────────
 
     def detect_workpieces(self, image: np.ndarray) -> List[Dict]:
         """
-        Detect workpieces in the image.
-        Returns a list of dicts with id, class, confidence, angle_deg,
-        box_px, corners_px, segmentation_px, corners_mm, segmentation_mm,
-        box_mm, area_mm2.
+        Detect workpieces in the camera frame.
+
+        Returns a list of dicts, each containing:
+            id, class, confidence, angle_deg,
+            box_px, corners_px, segmentation_px,
+            corners_mm, segmentation_mm, box_mm, area_mm2
         """
-        if not self.initialized or image is None:
+        if image is None:
             return []
 
-        # Step 0: Undistort the fisheye lens before processing
         from .calibration import calibration_service
         image = calibration_service.undistort(image)
 
-        # Log frame brightness so dark/underexposed frames are immediately visible
         mean_brightness = float(np.mean(image))
         logger.debug(f"Input frame mean brightness: {mean_brightness:.1f}")
         if mean_brightness < 15:
             logger.warning(
-                f"Input frame is very dark (mean={mean_brightness:.1f}). "
-                "Camera may still be settling AE — detection results may be unreliable."
+                f"Frame very dark (mean={mean_brightness:.1f}). "
+                "AE may still be settling — results may be unreliable."
             )
 
-        # Prepare debug drawing on the raw frame
-        debug_img = image.copy()
+        results = self._detect_objects(image)
 
-        if self.use_hailo:
-            results = self._run_hailo_inference(image)
-            # If NPU found nothing confident, try software fallback
-            if not results:
-                logger.info("Hailo NPU found no objects. Falling back to software detection...")
-                results = self._software_detect(image)
-        else:
-            results = self._software_detect(image)
-
-        # Draw final detections on debug image
-        for wp in results:
-            pts = np.array(wp['corners_px'], dtype=np.int32)
-            mm_pts = wp['corners_mm']
-            cv2.polylines(debug_img, [pts], True, (0, 255, 0), 2)
-
-            label = f"{wp['id']}"
-            cv2.putText(debug_img, label, (pts[0][0], pts[0][1] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-            for i, (px, mm) in enumerate(zip(pts, mm_pts)):
-                mm_label = f"({int(mm[0])},{int(mm[1])})"
-                cv2.putText(debug_img, mm_label, (px[0], px[1]),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-
-        # ── Composite diagnostic debug image ─────────────────────────────────
-        # Panel A (left):  raw camera frame with detection overlays
-        # Panel B (right): processed grayscale used by the detector
-        # Saves at a fixed output width to keep file size manageable.
-        debug_path = "calibration_data/detect_debug.jpg"
-        os.makedirs(os.path.dirname(debug_path), exist_ok=True)
-        try:
-            MAX_DEBUG_W = 1280
-            h, w = debug_img.shape[:2]
-            scale = min(1.0, MAX_DEBUG_W / w)
-            th = int(h * scale)
-            tw = int(w * scale)
-
-            panel_a = cv2.resize(debug_img, (tw, th))
-
-            # Build a grayscale visualisation of what the detector worked on
-            gray_proc = cv2.cvtColor(
-                cv2.resize(image, (tw, th)), cv2.COLOR_BGR2GRAY
-            )
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            gray_proc = clahe.apply(gray_proc)
-            panel_b = cv2.cvtColor(gray_proc, cv2.COLOR_GRAY2BGR)
-
-            # Add panel labels
-            label_args = dict(fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.7,
-                              color=(0, 255, 255), thickness=2)
-            cv2.putText(panel_a, f"RAW  mean={mean_brightness:.0f}",
-                        (10, 30), **label_args)
-            cv2.putText(panel_b, "CLAHE gray (detector input)",
-                        (10, 30), **label_args)
-
-            composite = np.hstack([panel_a, panel_b])
-            cv2.imwrite(debug_path, composite)
-        except Exception as e:
-            logger.warning(f"Failed to save composite debug image: {e}")
-            cv2.imwrite(debug_path, debug_img)
-
+        self._save_debug_image(image, results, mean_brightness)
         return results
 
 

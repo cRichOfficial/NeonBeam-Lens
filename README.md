@@ -1,14 +1,15 @@
 # NeonBeam Lens
-### Machine Vision Layer — AI Workpiece Detection & Camera Calibration
+### Machine Vision Layer — Workpiece Detection & Camera Calibration
 
-NeonBeam Lens is a Python FastAPI service designed for the **Raspberry Pi 5** (with optional **Hailo-8L AI NPU**). It provides the "eyes" for the NeonBeam laser engraver suite, handling real-time workpiece detection, camera-to-bed calibration, and automatic design alignment.
+NeonBeam Lens is a Python FastAPI service designed for the **Raspberry Pi 5**. It provides the "eyes" for the NeonBeam laser engraver suite, handling real-time workpiece detection, camera-to-bed calibration, and automatic design alignment.
 
 ---
 
 ## Features
 
 - **AprilTag Calibration**: Automatic mapping of camera pixels to physical laser bed coordinates (mm) using standard AprilTags placed at known positions on the bed corners.
-- **NPU-Accelerated Instance Segmentation**: High-speed workpiece boundary detection using YOLOv8-seg on the Hailo-8L NPU. Falls back to an OpenCV morphological contour detector when running without Hailo hardware.
+- **Texture-Based Workpiece Detection**: Detects objects of **any colour** (bright wood, dark slate, clear acrylic) on the black honeycomb bed using local-variance texture analysis. The honeycomb's repeating hole pattern has high local pixel variance; any solid workpiece has low variance.
+- **Multi-Object Support**: Detects and returns all workpieces simultaneously, each with physical boundaries, orientation angle, segmentation polygon, and area in mm².
 - **Auto-Layout Engine**: Calculates optimal rotation, scale, and placement for artwork based on detected material boundaries.
 - **Live Preview**: Real-time MJPEG stream for remote visual alignment.
 
@@ -30,6 +31,23 @@ The service captures at the sensor's full native resolution by default (`CAMERA_
 
 ---
 
+## How Detection Works
+
+The detector uses **local texture variance** to distinguish workpieces from the honeycomb bed:
+
+1. **Downsample** the camera frame to `DETECT_MAX_DIM` px on the long side (default 1280).
+2. **Preprocess**: Convert to grayscale, apply CLAHE contrast enhancement, and Gaussian blur to smooth away per-pixel noise while preserving the honeycomb texture pattern.
+3. **Build ROI**: Detect AprilTags on the full-resolution image (where the ArUco parameters are tuned) and construct a convex hull mask. Only the area inside the tags is searched — the laser frame, table, and cables are excluded.
+4. **Compute local variance**: `Var(X) = E[X²] − E[X]²` in a sliding window of `DETECT_VARIANCE_WINDOW` pixels. This is implemented with two fast box filters.
+5. **Threshold**: The honeycomb (repeating holes) has high variance; a solid workpiece has low variance. We estimate the honeycomb baseline from the 60th percentile of in-ROI variance and threshold at 40% of that value.
+6. **Morphological close + dilate** to merge gaps (wood grain, knots, honeycomb shadows at edges).
+7. **Find contours**, scale to full resolution, compute oriented bounding rect + convex hull.
+8. **Map to mm** via the calibration homography and apply physical area filtering.
+
+This approach detects workpieces of **any brightness** — bright wood, white paper, dark slate, and clear acrylic all produce low local variance compared to the honeycomb.
+
+---
+
 ## Environment Variables
 
 ### Camera
@@ -42,48 +60,42 @@ The service captures at the sensor's full native resolution by default (`CAMERA_
 | `FISHEYE_LENS` | `False` | Apply fisheye undistortion (requires manual K/D coefficient tuning). Not needed for the IMX708 102° lens. |
 | `WORKSPACE_HEIGHT_MM` | `500` | Physical height of the laser bed in mm. Used to flip the Y-axis so (0,0) is bottom-left. Set to `0` to disable Y-flip. |
 
-### NPU / Hailo
+### Auto-Exposure Settling
 
 | Variable | Default | Description |
 |---|---|---|
-| `USE_HAILO` | `False` | Enable Hailo-8L NPU inference. If `True`, the service will fail to start if hardware or the HEF model is missing. |
-| `MODEL_PATH` | `app/models/yolov8s_seg.hef` | Path to the Hailo Executable Format segmentation model. |
-| `DETECT_CONF_THRESHOLD` | `0.4` | Minimum confidence score for an NPU detection to be accepted (0.0–1.0). |
+| `MIN_FRAME_BRIGHTNESS` | `20` | Mean pixel brightness below which a frame is considered too dark. |
+| `AE_SETTLE_RETRIES` | `10` | Maximum retry attempts while waiting for AE to stabilise. |
+| `AE_SETTLE_DELAY` | `0.1` | Seconds between AE retry attempts. Total max wait = retries × delay. |
 
-### Detection & Post-Processing
+### Detection
 
 | Variable | Default | Description |
 |---|---|---|
-| `DETECT_MAX_DIM` | `1280` | Maximum long-side resolution (px) for the **detection processing pipeline**. See note below. |
-| `MIN_WORKPIECE_AREA_MM2` | `500` | Minimum physical area (mm²) to report as a workpiece. Filters out debris and noise. |
-| `MAX_WORKPIECE_AREA_MM2` | `160000` | Maximum physical area (mm²). Filters out the bed frame itself (~400×400mm = 160,000 mm²). |
-| `HONEYCOMB_KERNEL_SIZE` | `25` | Morphological kernel size (px at 720p reference) for bridging honeycomb gaps within a workpiece blob. |
-| `APRILTAG_MASK_PADDING` | `30` | Extra pixels (at 720p reference) to expand the AprilTag exclusion zone. Increase if the white paper backing the tags is being detected as a workpiece. |
+| `DETECT_MAX_DIM` | `1280` | Maximum long-side resolution (px) for the detection pipeline. See below. |
+| `DETECT_VARIANCE_WINDOW` | `25` | Local-variance window size (px at 720p reference). Must span several honeycomb holes. |
+| `MIN_WORKPIECE_AREA_MM2` | `500` | Minimum physical area (mm²) to report as a workpiece. |
+| `MAX_WORKPIECE_AREA_MM2` | `160000` | Maximum physical area (mm²). Filters out the bed frame itself. |
+| `HONEYCOMB_KERNEL_SIZE` | `25` | Morphological kernel (px at 720p ref) for bridging gaps within a workpiece. |
+| `APRILTAG_MASK_PADDING` | `30` | Extra pixels (720p ref) to expand the AprilTag exclusion zone. |
 
 ### Logging
 
 | Variable | Default | Description |
 |---|---|---|
-| `VISION_DEBUG_LOGGING` | `True` | `True` = DEBUG level (frame timings, scores, matrices). `False` = INFO level (normal operation). |
+| `VISION_DEBUG_LOGGING` | `True` | `True` = DEBUG level (frame timings, variance stats). `False` = INFO only. |
 
 ---
 
 ### About `DETECT_MAX_DIM`
 
-The software object detection pipeline uses morphological image processing operations (Top-Hat transforms, Gaussian blur, morphological close). These operations scale with image resolution as **O(width × height × kernel²)**. At 12MP (4056×3040) with typical kernel sizes, this would take several minutes per frame — far too slow for interactive use.
+The detection pipeline downsamples the camera frame to a capped working resolution before any expensive processing. Only the detection pipeline uses this downsampled copy; the original full-resolution frame is preserved. Detected workpiece contours are scaled back to full-resolution coordinates before the calibration homography maps them to physical mm values, so **accuracy is not affected**.
 
-`DETECT_MAX_DIM` solves this by **downsampling the camera frame to a capped working resolution** before any expensive processing. Only the detection pipeline uses this downsampled copy; the original full-resolution frame is preserved. Detected workpiece contours are scaled back to full-resolution coordinates before the calibration homography maps them to physical mm values, so **accuracy is not affected**.
-
-**Choosing a value:**
-
-| `DETECT_MAX_DIM` | Approx. working size | Typical detection time (Pi 5) | Use when… |
+| `DETECT_MAX_DIM` | Working size (approx.) | Detection time (Pi 5) | Use when… |
 |---|---|---|---|
-| `640` | 640×480 | ~0.1s | Fastest; good for large workpieces only |
-| `1280` *(default)* | 1280×960 | ~0.3s | Best balance for most workpieces |
-| `1920` | 1920×1440 | ~0.8s | Needed for very small or intricate items |
-| `2560` | 2560×1920 | ~2s | Maximum detail; likely unnecessary |
-
-**You only need to change this if** detection is either too slow (lower the value) or workpiece outlines are too coarse and missing small items (raise the value). For most use cases the default `1280` is correct.
+| `640` | 640×360 | ~0.1s | Fastest; good for large workpieces only |
+| `1280` *(default)* | 1280×720 | ~0.3s | Best balance for most workpieces |
+| `1920` | 1920×1080 | ~0.8s | Finer contour detail for small/intricate items |
 
 ---
 
@@ -103,17 +115,21 @@ The software object detection pipeline uses morphological image processing opera
 - **`GET /api/lens/calibration/check`** — Live quality check. Detects visible AprilTags in the current frame and returns per-tag reprojection error in mm. Saves a debug image viewable at `/api/lens/calibration/debug-image`.
 
 ### 3. Detection
-- **`GET /api/lens/detect`** — Returns detected workpieces with physical boundaries, segmentation polygon, orientation angle, and area. Saves a debug image viewable at `/api/lens/detect/debug-image`.
+- **`GET /api/lens/detect`** — Returns all detected workpieces with physical boundaries, segmentation polygon, orientation angle, and area. Saves a debug image viewable at `/api/lens/detect/debug-image`.
   ```json
   {
-    "id": "wp_000",
-    "class": "workpiece",
-    "confidence": 1.0,
-    "angle_deg": 12.3,
-    "corners_mm": [[x,y],[x,y],[x,y],[x,y]],
-    "segmentation_mm": [[x,y], "..."],
-    "box_mm": [x1, y1, x2, y2],
-    "area_mm2": 9800.5
+    "workpieces": [
+      {
+        "id": "wp_000",
+        "class": "workpiece",
+        "confidence": 1.0,
+        "angle_deg": 12.3,
+        "corners_mm": [[x,y],[x,y],[x,y],[x,y]],
+        "segmentation_mm": [[x,y], "..."],
+        "box_mm": [x1, y1, x2, y2],
+        "area_mm2": 9800.5
+      }
+    ]
   }
   ```
 - **`GET /api/lens/stream`** — Real-time MJPEG preview stream (~25 FPS).
@@ -132,15 +148,6 @@ The software object detection pipeline uses morphological image processing opera
 
 ## Production (Raspberry Pi 5 — Native)
 
-### Prerequisites
-
-Ensure the following are installed on the Pi before running `setup_native.sh`:
-- HailoRT PCIe Driver (`.deb`) — from [Hailo Developer Zone](https://hailo.ai/developer-zone/)
-- HailoRT (`.deb`) — from Hailo Developer Zone
-- HailoRT Python Bindings (`.whl`) — from Hailo Developer Zone
-
-> If you are running **without** the Hailo NPU (software-only mode), none of the above are required.
-
 ### Setup
 
 ```bash
@@ -153,11 +160,10 @@ cp .env.example .env
 
 `setup_native.sh` will:
 1. Install system dependencies (including `libcamera`, `picamera2`)
-2. Create a Python virtual environment (`--system-site-packages` for Hailo/Picamera2 access)
+2. Create a Python virtual environment (`--system-site-packages` for Picamera2 access)
 3. Install Python requirements
 4. Create calibration data directories
-5. Install `hailo-apps` and symlink `yolov8s_seg.hef` into `app/models/`
-6. Register and enable the `neonbeam-lens` systemd service
+5. Register and enable the `neonbeam-lens` systemd service
 
 ### Start / Monitor the Service
 
@@ -169,7 +175,7 @@ journalctl -u neonbeam-lens -f
 
 ---
 
-## Development (CPU Fallback, No Camera Hardware)
+## Development (No Camera Hardware)
 
 ### Prerequisites
 - Python 3.11+
@@ -179,11 +185,9 @@ journalctl -u neonbeam-lens -f
 
 ```bash
 cp .env.example .env
-# Set USE_HAILO=False and VISION_CAMERA_ID=0 (USB webcam)
+# Set VISION_CAMERA_ID=0 (USB webcam or laptop camera)
 uvicorn app.main:app --port 8001 --reload
 ```
-
-When `USE_HAILO=False`, the service uses the OpenCV morphological contour detector. This works well for high-contrast workpieces (light wood on a dark honeycomb bed) and is suitable for API integration testing.
 
 ---
 
@@ -202,10 +206,9 @@ When `USE_HAILO=False`, the service uses the OpenCV morphological contour detect
 app/
 ├── main.py             # FastAPI entry point & routes
 ├── services/
-│   ├── camera.py       # Frame acquisition, HDR, streaming (Picamera2 / OpenCV)
+│   ├── camera.py       # Frame acquisition, HDR, AE settling (Picamera2 / OpenCV)
 │   ├── calibration.py  # AprilTag detection & homography calibration
-│   ├── inference.py    # NPU inference & OpenCV fallback workpiece detection
+│   ├── inference.py    # Texture-variance workpiece detection
 │   └── transform.py    # Auto-layout calculation engine
-├── models/             # Hailo .hef model files (see models/README.md)
 calibration_data/       # Stored homography matrix (matrix.json) & debug images
 ```
