@@ -823,26 +823,32 @@ class AprilTagGenerator:
         text_row_h = th + baseline + unit
         footer_h   = tag_gap + text_row_h + unit
 
-        # The safe zone (white gap between the tag and the cut border) is
-        # always exactly 1 unit on all sides, regardless of guide_distance_mm.
-        # In guide mode the footer (ID text) is appended below the cut border.
-        tag_x = unit
-        tag_y = unit
-        cut_w = size_px + 2 * unit
-        cut_h = size_px + 2 * unit    # guide mode: square cut border
-
         if guide_distance_mm > 0.0:
-            # Footer goes below the cut guide
+            # guide_offset_px = how far from center the ticks land on the border.
+            # The canvas must be wide/tall enough that the ticks never need to be
+            # clamped.  half_canvas = max(guide needs, minimum 1-unit safe zone).
+            guide_offset_px = int((guide_distance_mm / 25.4) * dpi)
+            min_half = size_px // 2 + unit          # 1-unit safe zone
+            half_canvas = max(guide_offset_px + border_thickness, min_half)
+
+            cut_w = 2 * half_canvas
+            cut_h = 2 * half_canvas                  # square cut border
+            tag_x = half_canvas - size_px // 2       # centers tag inside cut guide
+            tag_y = half_canvas - size_px // 2
+
             total_w = cut_w
-            total_h = cut_h + footer_h
+            total_h = cut_h + footer_h               # footer below the cut guide
             footer_top = cut_h
         else:
-            # Original layout: footer is part of the overall bordered canvas
-            tag_y = top_gap                          # 1 unit gap on top only
-            cut_h = size_px + top_gap + tag_gap      # height up to the divider
+            # Original layout: 1-unit margin, footer inside the overall border.
+            tag_x = unit
+            tag_y = top_gap
+            cut_w = size_px + 2 * unit
+            cut_h = size_px + top_gap + tag_gap
             total_w = cut_w
             total_h = size_px + top_gap + footer_h
             footer_top = tag_y + size_px + tag_gap
+            guide_offset_px = 0                      # unused in this branch
 
         canvas = np.ones((total_h, total_w, 3), dtype=np.uint8) * 255
 
@@ -874,22 +880,16 @@ class AprilTagGenerator:
             cv2.line(canvas, (0, total_h - 1), (total_w - 1, total_h - 1), (0, 0, 0), border_thickness)
 
             # ── Alignment ticks at guide_distance_mm from the tag center ──────
-            # Center of the tag within the canvas
-            center_x = tag_x + size_px // 2   # = unit + size_px // 2
-            center_y = tag_y + size_px // 2   # = unit + size_px // 2
-
-            # Pixel offset from tag center to tick position along the border
-            guide_offset_px = int((guide_distance_mm / 25.4) * dpi)
+            # Canvas was already expanded so these values are always in-bounds.
+            center_x = tag_x + size_px // 2
+            center_y = tag_y + size_px // 2
 
             tick_len_px = int((3.0 / 25.4) * dpi)
 
-            # Tick X positions along top/bottom borders (clamped inside canvas)
-            tick_left_x  = max(border_thickness, min(cut_w - 1 - border_thickness, center_x - guide_offset_px))
-            tick_right_x = max(border_thickness, min(cut_w - 1 - border_thickness, center_x + guide_offset_px))
-
-            # Tick Y positions along left/right borders (clamped inside cut area)
-            tick_top_y    = max(border_thickness, min(cut_h - 1 - border_thickness, center_y - guide_offset_px))
-            tick_bottom_y = max(border_thickness, min(cut_h - 1 - border_thickness, center_y + guide_offset_px))
+            tick_left_x  = center_x - guide_offset_px
+            tick_right_x = center_x + guide_offset_px
+            tick_top_y   = center_y - guide_offset_px
+            tick_bottom_y = center_y + guide_offset_px
 
             # Top border — ticks point downward
             cv2.line(canvas, (tick_left_x,  0), (tick_left_x,  tick_len_px), (0, 0, 0), border_thickness)
