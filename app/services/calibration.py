@@ -780,7 +780,7 @@ class LensCalibrationSession:
 
 class AprilTagGenerator:
     @staticmethod
-    def generate(tag_id: int, size_mm: float = 50.0, dpi: int = 300, return_pil: bool = False) -> Union[bytes, Image.Image]:
+    def generate(tag_id: int, size_mm: float = 50.0, dpi: int = 300, return_pil: bool = False, guide_distance_mm: float = 0.0) -> Union[bytes, Image.Image]:
         """
         Generate an AprilTag image with a cut-guide border and a labeled footer.
 
@@ -829,15 +829,33 @@ class AprilTagGenerator:
         text_row_h = th + baseline + unit
         footer_h   = tag_gap + text_row_h + unit
 
-        total_w = size_px + 2 * unit
-        total_h = size_px + top_gap + footer_h
+        if guide_distance_mm > 0.0:
+            guide_px = int((guide_distance_mm / 25.4) * dpi)
+            min_half = size_px // 2 + unit
+            if guide_px < min_half:
+                guide_px = min_half
+                
+            center_x = guide_px
+            center_y = guide_px
+            total_w = 2 * guide_px
+            total_h = 2 * guide_px
+            tag_x = center_x - size_px // 2
+            tag_y = center_y - size_px // 2
+        else:
+            total_w = size_px + 2 * unit
+            total_h = size_px + top_gap + footer_h
+            tag_x = unit
+            tag_y = top_gap
+            center_x = tag_x + size_px // 2
+            center_y = tag_y + size_px // 2
 
         canvas = np.ones((total_h, total_w, 3), dtype=np.uint8) * 255
 
         # ── Paste tag ────────────────────────────────────────────────────────
-        tag_y = top_gap
-        tag_x = unit
-        canvas[tag_y:tag_y + size_px, tag_x:tag_x + size_px] = tag_img_rgb
+        paste_h = min(size_px, total_h - tag_y)
+        paste_w = min(size_px, total_w - tag_x)
+        if paste_h > 0 and paste_w > 0:
+            canvas[tag_y:tag_y + paste_h, tag_x:tag_x + paste_w] = tag_img_rgb[:paste_h, :paste_w]
 
         # ── ID text — centered horizontally in footer ────────────────────────
         # Divider sits 1 unit below the tag bottom
@@ -845,8 +863,9 @@ class AprilTagGenerator:
         text_x = (total_w - tw) // 2
         # Text baseline sits 1 unit below the divider + text height
         text_y = footer_top + unit + th
-        cv2.putText(canvas, text, (text_x, text_y), font,
-                    font_scale, (0, 0, 0), text_thickness, cv2.LINE_AA)
+        if text_y < total_h:
+            cv2.putText(canvas, text, (text_x, text_y), font,
+                        font_scale, (0, 0, 0), text_thickness, cv2.LINE_AA)
 
         # ── Cut-guide border ─────────────────────────────────────────────────
         cv2.rectangle(canvas,
@@ -854,21 +873,46 @@ class AprilTagGenerator:
                       (total_w - 1, total_h - 1),
                       (0, 0, 0), border_thickness)
 
-        # ── Footer side borders (extend from divider to bottom border) ───────
-        cv2.line(canvas,
-                 (0, footer_top),
-                 (0, total_h - 1),
-                 (0, 0, 0), border_thickness)
-        cv2.line(canvas,
-                 (total_w - 1, footer_top),
-                 (total_w - 1, total_h - 1),
-                 (0, 0, 0), border_thickness)
+        if guide_distance_mm <= 0.0:
+            # ── Footer side borders (extend from divider to bottom border) ───────
+            cv2.line(canvas,
+                     (0, footer_top),
+                     (0, total_h - 1),
+                     (0, 0, 0), border_thickness)
+            cv2.line(canvas,
+                     (total_w - 1, footer_top),
+                     (total_w - 1, total_h - 1),
+                     (0, 0, 0), border_thickness)
 
-        # ── Horizontal divider between tag gap and footer text area ──────────
-        cv2.line(canvas,
-                 (0, footer_top),
-                 (total_w - 1, footer_top),
-                 (0, 0, 0), border_thickness)
+            # ── Horizontal divider between tag gap and footer text area ──────────
+            cv2.line(canvas,
+                     (0, footer_top),
+                     (total_w - 1, footer_top),
+                     (0, 0, 0), border_thickness)
+        else:
+            # Draw standard footer dividers first
+            cv2.line(canvas, (0, footer_top), (0, total_h - 1), (0, 0, 0), border_thickness)
+            cv2.line(canvas, (total_w - 1, footer_top), (total_w - 1, total_h - 1), (0, 0, 0), border_thickness)
+            cv2.line(canvas, (0, footer_top), (total_w - 1, footer_top), (0, 0, 0), border_thickness)
+
+            # ── Draw inward alignment ticks (8 ticks aligning with tag edges) ────
+            tick_len_px = int((3.0 / 25.4) * dpi)
+            
+            # Top edge (pointing down)
+            cv2.line(canvas, (tag_x, 0), (tag_x, tick_len_px), (0, 0, 0), border_thickness)
+            cv2.line(canvas, (tag_x + size_px, 0), (tag_x + size_px, tick_len_px), (0, 0, 0), border_thickness)
+            
+            # Bottom edge (pointing up)
+            cv2.line(canvas, (tag_x, total_h - 1), (tag_x, total_h - 1 - tick_len_px), (0, 0, 0), border_thickness)
+            cv2.line(canvas, (tag_x + size_px, total_h - 1), (tag_x + size_px, total_h - 1 - tick_len_px), (0, 0, 0), border_thickness)
+            
+            # Left edge (pointing right)
+            cv2.line(canvas, (0, tag_y), (tick_len_px, tag_y), (0, 0, 0), border_thickness)
+            cv2.line(canvas, (0, tag_y + size_px), (tick_len_px, tag_y + size_px), (0, 0, 0), border_thickness)
+            
+            # Right edge (pointing left)
+            cv2.line(canvas, (total_w - 1, tag_y), (total_w - 1 - tick_len_px, tag_y), (0, 0, 0), border_thickness)
+            cv2.line(canvas, (total_w - 1, tag_y + size_px), (total_w - 1 - tick_len_px, tag_y + size_px), (0, 0, 0), border_thickness)
 
         # ── Save ─────────────────────────────────────────────────────────────
         final_img = Image.fromarray(canvas)
@@ -884,7 +928,7 @@ class AprilTagGenerator:
 
     @staticmethod
     def generate_batch_document(start_id: int, count: int, size_mm: float = 50.0, dpi: int = 300, 
-                                paper_width_in: float = 8.5, paper_height_in: float = 11.0) -> bytes:
+                                paper_width_in: float = 8.5, paper_height_in: float = 11.0, guide_distance_mm: float = 0.0) -> bytes:
         """
         Generate a multi-page PDF containing the requested tags packed densely.
         """
@@ -892,7 +936,7 @@ class AprilTagGenerator:
         paper_h_px = int(paper_height_in * dpi)
         
         # Get one tag to find its total size
-        sample_tag = AprilTagGenerator.generate(start_id, size_mm, dpi, return_pil=True)
+        sample_tag = AprilTagGenerator.generate(start_id, size_mm, dpi, return_pil=True, guide_distance_mm=guide_distance_mm)
         tag_w, tag_h = sample_tag.size
         
         # Add padding between tags and page edges (10mm margin to prevent printer clipping)
@@ -914,7 +958,7 @@ class AprilTagGenerator:
         
         for i in range(count):
             tag_id = start_id + i
-            tag_img = AprilTagGenerator.generate(tag_id, size_mm, dpi, return_pil=True)
+            tag_img = AprilTagGenerator.generate(tag_id, size_mm, dpi, return_pil=True, guide_distance_mm=guide_distance_mm)
             
             idx_on_page = i % tags_per_page
             

@@ -92,15 +92,15 @@ async def health_check():
     }
 
 @app.get("/api/apriltag/generate/{tag_id}")
-async def generate_tag(tag_id: int, size_mm: float = 50.0, dpi: int = 300):
+async def generate_tag(tag_id: int, size_mm: float = 50.0, dpi: int = 300, guide_distance_mm: float = 0.0):
     """Generate a single tag with physical sizing metadata."""
-    tag_bytes = AprilTagGenerator.generate(tag_id, size_mm, dpi)
+    tag_bytes = AprilTagGenerator.generate(tag_id, size_mm, dpi, guide_distance_mm=guide_distance_mm)
     return Response(content=tag_bytes, media_type="application/pdf")
 
 @app.get("/api/apriltag/batch")
-async def batch_generate_tags(start_id: int = 0, count: int = 4, size_mm: float = 50.0, dpi: int = 300, paper_width_in: float = 8.5, paper_height_in: float = 11.0):
+async def batch_generate_tags(start_id: int = 0, count: int = 4, size_mm: float = 50.0, dpi: int = 300, paper_width_in: float = 8.5, paper_height_in: float = 11.0, guide_distance_mm: float = 0.0):
     """Return a multi-page PDF containing all requested tags packed for standard printing."""
-    pdf_bytes = AprilTagGenerator.generate_batch_document(start_id, count, size_mm, dpi, paper_width_in, paper_height_in)
+    pdf_bytes = AprilTagGenerator.generate_batch_document(start_id, count, size_mm, dpi, paper_width_in, paper_height_in, guide_distance_mm=guide_distance_mm)
     return Response(content=pdf_bytes, media_type="application/pdf")
 
 # ── Checkerboard Generation ──────────────────────────────────────────────────
