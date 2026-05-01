@@ -51,22 +51,36 @@ class CameraService:
             try:
                 self.picam2 = Picamera2()
 
+                hdr_env = os.getenv("CAMERA_HDR", "False").strip().lower() == "true"
+                controls = {}
+                if hdr_env:
+                    controls["HdrMode"] = 2  # 2 corresponds to libcamera.controls.HdrModeEnum.Sensor
+                    logger.info("Picamera2: Requesting Hardware HDR (Sensor mode)")
+
                 if res_env == "max":
                     # Query the sensor's full pixel array size — the true hardware maximum
                     sensor_res = self.picam2.camera_properties.get("PixelArraySize")
                     if sensor_res:
                         capture_w, capture_h = sensor_res
-                        logger.info(f"Picamera2: using max sensor resolution {capture_w}x{capture_h}")
+                        if hdr_env and capture_w > 2304:
+                            # IMX708 hardware HDR is limited to ~3MP (2304x1296)
+                            capture_w, capture_h = 2304, 1296
+                            logger.info(f"Picamera2: Capping max resolution to {capture_w}x{capture_h} for HDR mode")
+                        else:
+                            logger.info(f"Picamera2: using max sensor resolution {capture_w}x{capture_h}")
                     else:
                         # Fallback: pick the largest mode available
                         modes = self.picam2.sensor_modes
                         if modes:
                             largest = max(modes, key=lambda m: m["size"][0] * m["size"][1])
                             capture_w, capture_h = largest["size"]
+                            if hdr_env and capture_w > 2304:
+                                capture_w, capture_h = 2304, 1296
                             logger.info(f"Picamera2: largest sensor mode {capture_w}x{capture_h}")
                         else:
-                            capture_w, capture_h = 4056, 3040  # Pi HQ safe default
-                            logger.warning("Picamera2: could not detect sensor modes, defaulting to 4056x3040")
+                            capture_w, capture_h = 2304 if hdr_env else 4056
+                            capture_h = 1296 if hdr_env else 3040  # Pi HQ safe default
+                            logger.warning(f"Picamera2: could not detect sensor modes, defaulting to {capture_w}x{capture_h}")
                 else:
                     try:
                         capture_w, capture_h = [int(v) for v in res_env.split("x")]
@@ -75,9 +89,12 @@ class CameraService:
                         logger.warning(f"Invalid CAMERA_RESOLUTION '{res_env}', falling back to max")
                         sensor_res = self.picam2.camera_properties.get("PixelArraySize", (4056, 3040))
                         capture_w, capture_h = sensor_res
+                        if hdr_env and capture_w > 2304:
+                            capture_w, capture_h = 2304, 1296
 
                 config = self.picam2.create_video_configuration(
-                    main={"format": "BGR888", "size": (capture_w, capture_h)}
+                    main={"format": "BGR888", "size": (capture_w, capture_h)},
+                    controls=controls
                 )
                 self.picam2.configure(config)
                 self.picam2.start()

@@ -34,24 +34,31 @@ class CalibrationService:
 
         # ── Tuning for small tags at high resolution ──────────────────────────
         # Default minMarkerPerimeterRate=0.03 requires perimeter >= 3% of image
-        # longest side. At 4608px that's ~138px — a 20mm tag in a fisheye corner
-        # can easily be smaller. Lower to 0.005 (~23px min perimeter).
-        self.aruco_params.minMarkerPerimeterRate = 0.005
+        # longest side. At 4608px that's ~138px. A 20mm tag is ~100px, perimeter ~400px (0.08).
+        # We can safely use 0.015 to ignore tiny noise but catch all tags.
+        self.aruco_params.minMarkerPerimeterRate = 0.015
         self.aruco_params.maxMarkerPerimeterRate = 4.0
 
-        # Widen the adaptive threshold window range so small tags at the
-        # dark/bright boundary of the fisheye edge are still binarized cleanly.
-        self.aruco_params.adaptiveThreshWinSizeMin = 3
-        self.aruco_params.adaptiveThreshWinSizeMax = 53
-        self.aruco_params.adaptiveThreshWinSizeStep = 4
+        # Widen the adaptive threshold window range significantly for 12MP.
+        # A tag might be 100-150px wide. The window should be large enough to cover the tag.
+        self.aruco_params.adaptiveThreshWinSizeMin = 13
+        self.aruco_params.adaptiveThreshWinSizeMax = 153
+        self.aruco_params.adaptiveThreshWinSizeStep = 10
+
+        # Lower the threshold constant because HDR can sometimes flatten local contrast
+        self.aruco_params.adaptiveThreshConstant = 5
+
+        # 102 HFOV still has barrel distortion near edges (where bottom tags are).
+        # Loosen the polygonal approximation to allow curved tag edges to be detected.
+        self.aruco_params.polygonalApproxAccuracyRate = 0.06
 
         # Allow slightly more error in corner refinement for small/distorted tags
         self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.aruco_params.cornerRefinementMaxIterations = 50
         self.aruco_params.cornerRefinementMinAccuracy = 0.05
 
-        # Allow a larger perspective distortion — important for fisheye corners
-        self.aruco_params.perspectiveRemovePixelPerCell = 4
+        # Use more pixels per cell for bit extraction since we have higher resolution
+        self.aruco_params.perspectiveRemovePixelPerCell = 8
         self.aruco_params.perspectiveRemoveIgnoredMarginPerCell = 0.13
 
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
