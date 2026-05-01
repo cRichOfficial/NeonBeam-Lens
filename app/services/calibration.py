@@ -793,21 +793,18 @@ class AprilTagGenerator:
           ├───────────────────────┤      bottom of tag
           │    ID: 0              │      text row (smaller, ~3mm)
           │                       │      1-unit gap below text
-        └ └───────────────────────┘ ┘  ← cut-guide border + footer bottom border
-          ↑                       ↑
-          side borders extend through footer
         """
         # Core pixel size of the tag itself
         size_px = int((size_mm / 25.4) * dpi)
 
-        # 1 "unit" = 10% of the tag size — used for all spacing
+        # 1 "unit" = 10% of the tag size -- used for all spacing
         unit = max(4, size_px // 10)
 
         aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         tag_img = cv2.aruco.generateImageMarker(aruco_dict, tag_id, size_px)
         tag_img_rgb = cv2.cvtColor(tag_img, cv2.COLOR_GRAY2RGB)
 
-        # ── Text sizing ──────────────────────────────────────────────────────
+        # -- Text sizing --
         text = f"ID: {tag_id}"
         font = cv2.FONT_HERSHEY_SIMPLEX
         border_thickness = max(1, unit // 8)
@@ -820,37 +817,32 @@ class AprilTagGenerator:
         font_scale = target_text_h_px / float(th)
         (tw, th), baseline = cv2.getTextSize(text, font, font_scale, text_thickness)
 
-        # ── Canvas dimensions ────────────────────────────────────────────────
-        # Top:    1 unit gap above tag
-        # Middle: 1 unit gap below tag before divider line
-        # Footer: text height + baseline + 1 unit gap below text
+        # Footer height: gap below tag + text row + bottom gap
         top_gap    = unit
-        tag_gap    = unit          # white space between tag bottom and divider
+        tag_gap    = unit
         text_row_h = th + baseline + unit
         footer_h   = tag_gap + text_row_h + unit
 
+        # The safe zone (white gap between the tag and the cut border) is
+        # always exactly 1 unit on all sides, regardless of guide_distance_mm.
+        # In guide mode the footer (ID text) is appended below the cut border.
+        tag_x = unit
+        tag_y = unit
+        cut_w = size_px + 2 * unit
+        cut_h = size_px + 2 * unit    # guide mode: square cut border
+
         if guide_distance_mm > 0.0:
-            # guide_distance_mm = white margin from the tag edge to the cut-guide border.
-            # e.g. 20mm tag with 5mm guide → border is 5mm outside the tag on all sides.
-            guide_offset_px = max(1, int((guide_distance_mm / 25.4) * dpi))
-
-            tag_x = guide_offset_px
-            tag_y = guide_offset_px
-            cut_w = size_px + 2 * guide_offset_px
-            cut_h = size_px + 2 * guide_offset_px
-
+            # Footer goes below the cut guide
             total_w = cut_w
-            total_h = cut_h + footer_h  # text footer sits below the cut guide
+            total_h = cut_h + footer_h
+            footer_top = cut_h
         else:
-            total_w = size_px + 2 * unit
+            # Original layout: footer is part of the overall bordered canvas
+            tag_y = top_gap                          # 1 unit gap on top only
+            cut_h = size_px + top_gap + tag_gap      # height up to the divider
+            total_w = cut_w
             total_h = size_px + top_gap + footer_h
-            cut_w = total_w
-            cut_h = total_h
-            
-            tag_x = unit
-            tag_y = top_gap
-            center_x = tag_x + size_px // 2
-            center_y = tag_y + size_px // 2
+            footer_top = tag_y + size_px + tag_gap
 
         canvas = np.ones((total_h, total_w, 3), dtype=np.uint8) * 255
 
@@ -860,54 +852,62 @@ class AprilTagGenerator:
         if paste_h > 0 and paste_w > 0:
             canvas[tag_y:tag_y + paste_h, tag_x:tag_x + paste_w] = tag_img_rgb[:paste_h, :paste_w]
 
-        # ── ID text — centered horizontally in footer ────────────────────────
-        if guide_distance_mm > 0.0:
-            footer_top = cut_h
-        else:
-            footer_top = tag_y + size_px + tag_gap
-
+        # ── ID text — centered horizontally in footer ─────────────────────────
         text_x = (total_w - tw) // 2
         text_y = footer_top + unit + th
         if text_y < total_h:
             cv2.putText(canvas, text, (text_x, text_y), font,
                         font_scale, (0, 0, 0), text_thickness, cv2.LINE_AA)
 
-        # ── Cut-guide border ─────────────────────────────────────────────────
-        cv2.rectangle(canvas,
-                      (0, 0),
-                      (cut_w - 1, cut_h - 1),
-                      (0, 0, 0), border_thickness)
-
-        if guide_distance_mm <= 0.0:
-            # ── Horizontal divider between tag gap and footer text area ──────────
-            cv2.line(canvas,
-                     (0, footer_top),
-                     (total_w - 1, footer_top),
-                     (0, 0, 0), border_thickness)
+        # ── Cut-guide border (always wraps tag + 1-unit safe zone) ───────────
+        if guide_distance_mm > 0.0:
+            border_rect_h = cut_h - 1
         else:
-            # ── Box around the footer text ───────────────────────────────────────
+            border_rect_h = total_h - 1
+
+        cv2.rectangle(canvas, (0, 0), (cut_w - 1, border_rect_h), (0, 0, 0), border_thickness)
+
+        if guide_distance_mm > 0.0:
+            # ── Footer box (left, right, bottom) below the cut guide ─────────
             cv2.line(canvas, (0, cut_h), (0, total_h - 1), (0, 0, 0), border_thickness)
             cv2.line(canvas, (total_w - 1, cut_h), (total_w - 1, total_h - 1), (0, 0, 0), border_thickness)
             cv2.line(canvas, (0, total_h - 1), (total_w - 1, total_h - 1), (0, 0, 0), border_thickness)
 
-            # ── Draw inward alignment ticks (8 ticks aligning with tag edges) ────
+            # ── Alignment ticks at guide_distance_mm from the tag center ──────
+            # Center of the tag within the canvas
+            center_x = tag_x + size_px // 2   # = unit + size_px // 2
+            center_y = tag_y + size_px // 2   # = unit + size_px // 2
+
+            # Pixel offset from tag center to tick position along the border
+            guide_offset_px = int((guide_distance_mm / 25.4) * dpi)
+
             tick_len_px = int((3.0 / 25.4) * dpi)
-            
-            # Top edge (pointing down)
-            cv2.line(canvas, (tag_x, 0), (tag_x, tick_len_px), (0, 0, 0), border_thickness)
-            cv2.line(canvas, (tag_x + size_px, 0), (tag_x + size_px, tick_len_px), (0, 0, 0), border_thickness)
-            
-            # Bottom edge (pointing up)
-            cv2.line(canvas, (tag_x, cut_h - 1), (tag_x, cut_h - 1 - tick_len_px), (0, 0, 0), border_thickness)
-            cv2.line(canvas, (tag_x + size_px, cut_h - 1), (tag_x + size_px, cut_h - 1 - tick_len_px), (0, 0, 0), border_thickness)
-            
-            # Left edge (pointing right)
-            cv2.line(canvas, (0, tag_y), (tick_len_px, tag_y), (0, 0, 0), border_thickness)
-            cv2.line(canvas, (0, tag_y + size_px), (tick_len_px, tag_y + size_px), (0, 0, 0), border_thickness)
-            
-            # Right edge (pointing left)
-            cv2.line(canvas, (cut_w - 1, tag_y), (cut_w - 1 - tick_len_px, tag_y), (0, 0, 0), border_thickness)
-            cv2.line(canvas, (cut_w - 1, tag_y + size_px), (cut_w - 1 - tick_len_px, tag_y + size_px), (0, 0, 0), border_thickness)
+
+            # Tick X positions along top/bottom borders (clamped inside canvas)
+            tick_left_x  = max(border_thickness, min(cut_w - 1 - border_thickness, center_x - guide_offset_px))
+            tick_right_x = max(border_thickness, min(cut_w - 1 - border_thickness, center_x + guide_offset_px))
+
+            # Tick Y positions along left/right borders (clamped inside cut area)
+            tick_top_y    = max(border_thickness, min(cut_h - 1 - border_thickness, center_y - guide_offset_px))
+            tick_bottom_y = max(border_thickness, min(cut_h - 1 - border_thickness, center_y + guide_offset_px))
+
+            # Top border — ticks point downward
+            cv2.line(canvas, (tick_left_x,  0), (tick_left_x,  tick_len_px), (0, 0, 0), border_thickness)
+            cv2.line(canvas, (tick_right_x, 0), (tick_right_x, tick_len_px), (0, 0, 0), border_thickness)
+
+            # Bottom border (of cut guide) — ticks point upward
+            cv2.line(canvas, (tick_left_x,  cut_h - 1), (tick_left_x,  cut_h - 1 - tick_len_px), (0, 0, 0), border_thickness)
+            cv2.line(canvas, (tick_right_x, cut_h - 1), (tick_right_x, cut_h - 1 - tick_len_px), (0, 0, 0), border_thickness)
+
+            # Left border — ticks point rightward
+            cv2.line(canvas, (0, tick_top_y),    (tick_len_px, tick_top_y),    (0, 0, 0), border_thickness)
+            cv2.line(canvas, (0, tick_bottom_y), (tick_len_px, tick_bottom_y), (0, 0, 0), border_thickness)
+
+            # Right border — ticks point leftward
+            cv2.line(canvas, (cut_w - 1, tick_top_y),    (cut_w - 1 - tick_len_px, tick_top_y),    (0, 0, 0), border_thickness)
+            cv2.line(canvas, (cut_w - 1, tick_bottom_y), (cut_w - 1 - tick_len_px, tick_bottom_y), (0, 0, 0), border_thickness)
+        else:
+            cv2.line(canvas, (0, footer_top), (total_w - 1, footer_top), (0, 0, 0), border_thickness)
 
         # ── Save ─────────────────────────────────────────────────────────────
         final_img = Image.fromarray(canvas)
