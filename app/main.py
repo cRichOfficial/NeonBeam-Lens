@@ -13,7 +13,10 @@ from typing import List, Optional, Dict, Any
 
 from .services.mdns_advertiser import MdnsAdvertiser
 from .services.camera import camera_service
-from .services.calibration import calibration_service, AprilTagGenerator
+from .services.calibration import (
+    calibration_service, AprilTagGenerator, CheckerboardGenerator,
+    LensCalibrationSession,
+)
 from .services.inference import inference_service
 from .services.transform import transform_service
 
@@ -83,7 +86,9 @@ async def health_check():
         "status": "ok", 
         "service": "machine_vision",
         "detector": "opencv",
-        "camera_active": camera_service.running
+        "camera_active": camera_service.running,
+        "lens_calibrated": calibration_service.lens_calibrated,
+        "homography_calibrated": calibration_service.homography_matrix is not None,
     }
 
 @app.get("/api/apriltag/generate/{tag_id}")
@@ -97,6 +102,72 @@ async def batch_generate_tags(start_id: int = 0, count: int = 4, size_mm: float 
     """Return a multi-page PDF containing all requested tags packed for standard printing."""
     pdf_bytes = AprilTagGenerator.generate_batch_document(start_id, count, size_mm, dpi, paper_width_in, paper_height_in)
     return Response(content=pdf_bytes, media_type="application/pdf")
+
+# ── Checkerboard Generation ──────────────────────────────────────────────────
+
+@app.get("/api/lens/checkerboard/generate")
+async def generate_checkerboard(
+    rows: int = 9, cols: int = 6, square_mm: float = 25.0, dpi: int = 300,
+):
+    """Generate a printable checkerboard PDF for lens distortion calibration."""
+    pdf_bytes = CheckerboardGenerator.generate(rows, cols, square_mm, dpi)
+    return Response(content=pdf_bytes, media_type="application/pdf")
+
+# ── Lens Distortion Calibration (guided multi-step) ──────────────────────────
+
+# Module-level session holder (one active session at a time)
+_lens_session: LensCalibrationSession | None = None
+
+@app.post("/api/lens/calibrate-lens/start")
+async def lens_calibration_start(
+    rows: int = 9, cols: int = 6, square_mm: float = 25.0,
+):
+    """Start a new guided lens calibration session."""
+    global _lens_session
+    _lens_session = LensCalibrationSession(rows=rows, cols=cols, square_mm=square_mm)
+    return _lens_session.start()
+
+@app.post("/api/lens/calibrate-lens/capture")
+async def lens_calibration_capture():
+    """Capture a frame and attempt to detect the checkerboard."""
+    if _lens_session is None or not _lens_session.active:
+        raise HTTPException(status_code=400, detail="No active lens calibration session. Call /start first.")
+    frame = camera_service.get_frame()
+    if frame is None:
+        raise HTTPException(status_code=503, detail="Camera frame not available.")
+    return _lens_session.capture(frame)
+
+@app.post("/api/lens/calibrate-lens/finish")
+async def lens_calibration_finish():
+    """Compute lens calibration from captured frames and save K/D coefficients."""
+    global _lens_session
+    if _lens_session is None or not _lens_session.active:
+        raise HTTPException(status_code=400, detail="No active lens calibration session.")
+    result = _lens_session.finish(calibration_service)
+    _lens_session = None
+    return result
+
+@app.get("/api/lens/calibrate-lens/status")
+async def lens_calibration_status():
+    """Get the current lens calibration session status."""
+    if _lens_session is None or not _lens_session.active:
+        # Check if a saved calibration exists
+        if calibration_service.lens_calibrated:
+            return {
+                "status": "calibrated",
+                "message": "Lens calibration is loaded from disk. No active session.",
+                "lens_model": "fisheye" if calibration_service.is_fisheye else "standard",
+            }
+        return {"status": "uncalibrated", "message": "No active session and no saved lens calibration."}
+    return _lens_session._status()
+
+@app.get("/api/lens/calibrate-lens/preview")
+async def lens_calibration_preview():
+    """Returns the preview image from the last lens calibration capture."""
+    debug_path = "calibration_data/lens_calibration_preview.jpg"
+    if not os.path.exists(debug_path):
+        raise HTTPException(status_code=404, detail="No preview available. Run a capture first.")
+    return FileResponse(debug_path, media_type="image/jpeg")
 
 @app.get("/api/lens/calibration/debug-image")
 async def get_calibration_debug_image():

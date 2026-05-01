@@ -4,8 +4,9 @@ import json
 import os
 import logging
 import io
-import base64
-from PIL import Image, ImageDraw
+import time
+import uuid
+from PIL import Image, ImageDraw, ImageFont
 from typing import List, Dict, Optional, Tuple, Union
 
 logger = logging.getLogger("vision_api.calibration")
@@ -13,20 +14,30 @@ logger = logging.getLogger("vision_api.calibration")
 class CalibrationService:
     def __init__(self, data_path: str = "calibration_data/matrix.json"):
         self.data_path = data_path
+        self.lens_data_path = os.path.join(
+            os.path.dirname(data_path), "lens_calibration.json"
+        )
         self.homography_matrix = None
         self.calibration_data = None
-        
-        # Generic Fisheye Calibration for 175 FOV lenses (Disabled by default)
+
+        # Lens distortion model: standard pinhole or fisheye (Kannala-Brandt)
         self.is_fisheye = os.getenv("FISHEYE_LENS", "False").lower() == "true"
-        # Standard estimates for a 1/4" sensor with 175 FOV
-        self.k = np.array([[600, 0, 640], [0, 600, 360], [0, 0, 1]], dtype=np.float32)
-        self.d = np.array([-0.05, -0.01, 0, 0], dtype=np.float32)
+
+        # Lens intrinsics — loaded from lens_calibration.json if available
+        self.camera_matrix = None   # K (3×3)
+        self.dist_coeffs = None     # D (standard: 5 or 8 coeffs, fisheye: 4)
+        self.lens_calibrated = False
+
+        # Cached undistort remap tables (computed once, applied via cv2.remap)
+        self._undistort_map1 = None
+        self._undistort_map2 = None
+        self._undistort_resolution = None  # (w, h) the maps were built for
 
         # Y-axis flip: camera sees Y=0 at top, laser bed uses Y=0 at bottom-left.
-        # Set WORKSPACE_HEIGHT_MM to the physical height of your bed in mm.
         self.workspace_height_mm = float(os.getenv("WORKSPACE_HEIGHT_MM", "0"))
-        
+
         self.load_calibration()
+        self._load_lens_calibration()
         
         # AprilTag setup (using Aruco module)
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
@@ -64,16 +75,64 @@ class CalibrationService:
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
     def load_calibration(self):
-        """Load calibration data from JSON file."""
+        """Load homography calibration data from JSON file."""
         if os.path.exists(self.data_path):
             try:
                 with open(self.data_path, 'r') as f:
                     data = json.load(f)
                     self.homography_matrix = np.array(data['matrix'])
                     self.calibration_data = data.get('calibration_data', None)
-                logger.info(f"Loaded calibration from {self.data_path}")
+                logger.info(f"Loaded homography from {self.data_path}")
             except Exception as e:
-                logger.error(f"Failed to load calibration: {e}")
+                logger.error(f"Failed to load homography: {e}")
+
+    def _load_lens_calibration(self):
+        """Load lens intrinsics (K, D) from disk if available."""
+        if not os.path.exists(self.lens_data_path):
+            logger.info("No lens calibration found — undistortion disabled.")
+            return
+        try:
+            with open(self.lens_data_path, 'r') as f:
+                data = json.load(f)
+            self.camera_matrix = np.array(data['camera_matrix'], dtype=np.float64)
+            self.dist_coeffs = np.array(data['dist_coeffs'], dtype=np.float64)
+            self.lens_calibrated = True
+            stored_model = data.get('model', 'standard')
+            logger.info(
+                f"Loaded lens calibration (model={stored_model}, "
+                f"RMS={data.get('rms_error', '?')}) from {self.lens_data_path}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to load lens calibration: {e}")
+
+    def _save_lens_calibration(
+        self, camera_matrix: np.ndarray, dist_coeffs: np.ndarray,
+        rms_error: float, image_size: Tuple[int, int],
+        num_images: int, model: str,
+    ) -> None:
+        """Persist lens intrinsics to disk."""
+        os.makedirs(os.path.dirname(self.lens_data_path), exist_ok=True)
+        data = {
+            'camera_matrix': camera_matrix.tolist(),
+            'dist_coeffs': dist_coeffs.tolist(),
+            'rms_error': rms_error,
+            'image_size': list(image_size),
+            'num_images': num_images,
+            'model': model,
+        }
+        with open(self.lens_data_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        self.camera_matrix = camera_matrix
+        self.dist_coeffs = dist_coeffs
+        self.lens_calibrated = True
+        # Invalidate cached maps so they're rebuilt on next undistort call
+        self._undistort_map1 = None
+        self._undistort_map2 = None
+        self._undistort_resolution = None
+        logger.info(
+            f"Saved lens calibration (model={model}, RMS={rms_error:.4f}) "
+            f"to {self.lens_data_path}"
+        )
 
     def save_calibration(self, matrix: np.ndarray, calibration_data: Dict = None):
         """Save calibration matrix to JSON file."""
@@ -208,16 +267,48 @@ class CalibrationService:
         return None
 
     def undistort(self, image: np.ndarray) -> np.ndarray:
-        """Apply fisheye undistortion if FISHEYE_LENS is enabled, otherwise no-op."""
-        if not self.is_fisheye:
+        """Apply lens distortion correction using calibrated K/D coefficients.
+
+        Uses cached remap tables for performance (~1ms per frame vs ~15ms for
+        cv2.undistort). The maps are rebuilt automatically if the frame
+        resolution changes.
+
+        Returns the image unchanged if no lens calibration has been performed.
+        """
+        if not self.lens_calibrated:
             return image
 
         h, w = image.shape[:2]
-        # Estimate a new camera matrix that retains the full FOV after correction
-        new_k = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-            self.k, self.d, (w, h), np.eye(3), balance=1.0
+
+        # Rebuild remap tables if resolution changed or first call
+        if self._undistort_resolution != (w, h):
+            logger.debug(f"Building undistort maps for {w}×{h}")
+            if self.is_fisheye:
+                new_k = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                    self.camera_matrix, self.dist_coeffs,
+                    (w, h), np.eye(3), balance=1.0,
+                )
+                self._undistort_map1, self._undistort_map2 = \
+                    cv2.fisheye.initUndistortRectifyMap(
+                        self.camera_matrix, self.dist_coeffs,
+                        np.eye(3), new_k, (w, h), cv2.CV_16SC2,
+                    )
+            else:
+                new_k, roi = cv2.getOptimalNewCameraMatrix(
+                    self.camera_matrix, self.dist_coeffs,
+                    (w, h), alpha=1.0,
+                )
+                self._undistort_map1, self._undistort_map2 = \
+                    cv2.initUndistortRectifyMap(
+                        self.camera_matrix, self.dist_coeffs,
+                        None, new_k, (w, h), cv2.CV_16SC2,
+                    )
+            self._undistort_resolution = (w, h)
+
+        return cv2.remap(
+            image, self._undistort_map1, self._undistort_map2,
+            cv2.INTER_LINEAR,
         )
-        return cv2.fisheye.undistortImage(image, self.k, self.d, Knew=new_k)
 
     def map_pixels_to_mm(self, points_px: np.ndarray) -> np.ndarray:
         """Transform pixel coordinates to physical mm using the calibration homography.
@@ -340,6 +431,352 @@ class CalibrationService:
             "per_tag_errors": per_tag_errors,
             "debug_image_url": "/api/lens/calibration/debug-image"
         }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Checkerboard Generator
+# ──────────────────────────────────────────────────────────────────────────────
+
+class CheckerboardGenerator:
+    """Generate printable checkerboard patterns for lens calibration."""
+
+    @staticmethod
+    def generate(
+        rows: int = 9, cols: int = 6, square_mm: float = 25.0, dpi: int = 300,
+    ) -> bytes:
+        """
+        Generate a printable PDF containing a checkerboard calibration pattern.
+
+        Args:
+            rows: Number of *inner* corners horizontally (squares = rows + 1).
+            cols: Number of *inner* corners vertically (squares = cols + 1).
+            square_mm: Physical side length of each square in mm.
+            dpi: Print resolution.
+
+        Returns:
+            PDF file as bytes.
+        """
+        sq_px = int((square_mm / 25.4) * dpi)
+        board_w = (rows + 1) * sq_px
+        board_h = (cols + 1) * sq_px
+
+        # Add margin for label text below the board
+        margin = max(20, sq_px // 2)
+        label_h = int((5.0 / 25.4) * dpi)  # ~5mm text height
+        total_w = board_w + 2 * margin
+        total_h = board_h + 2 * margin + label_h + margin
+
+        canvas = np.ones((total_h, total_w, 3), dtype=np.uint8) * 255
+
+        # Draw checkerboard
+        for r in range(cols + 1):
+            for c in range(rows + 1):
+                if (r + c) % 2 == 0:
+                    continue  # white square — already white
+                x = margin + c * sq_px
+                y = margin + r * sq_px
+                cv2.rectangle(canvas, (x, y), (x + sq_px, y + sq_px), (0, 0, 0), -1)
+
+        # Draw outer border
+        cv2.rectangle(
+            canvas, (margin, margin),
+            (margin + board_w, margin + board_h), (0, 0, 0), 2,
+        )
+
+        # Label
+        label = f"{rows}x{cols} inner corners | {square_mm:.1f}mm squares"
+        font_scale = max(0.4, label_h / 30.0)
+        text_thickness = max(1, int(font_scale))
+        (tw, th), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_thickness
+        )
+        text_x = (total_w - tw) // 2
+        text_y = margin + board_h + margin + th
+        cv2.putText(
+            canvas, label, (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), text_thickness,
+            cv2.LINE_AA,
+        )
+
+        img = Image.fromarray(canvas)
+        img.info['dpi'] = (dpi, dpi)
+        buf = io.BytesIO()
+        img.save(buf, format='PDF', resolution=dpi)
+        return buf.getvalue()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lens Calibration Session
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Zone names for the 3×3 placement grid
+_ZONE_NAMES = [
+    "top-left",    "top-center",    "top-right",
+    "center-left", "center",        "center-right",
+    "bottom-left", "bottom-center", "bottom-right",
+]
+
+_ZONE_INSTRUCTIONS = {
+    "top-left":       "Place the board in the TOP-LEFT area of the frame.",
+    "top-center":     "Place the board in the TOP-CENTER area of the frame.",
+    "top-right":      "Place the board in the TOP-RIGHT area of the frame.",
+    "center-left":    "Place the board in the LEFT-CENTER area of the frame.",
+    "center":         "Place the board in the CENTER of the frame.",
+    "center-right":   "Place the board in the RIGHT-CENTER area of the frame.",
+    "bottom-left":    "Place the board in the BOTTOM-LEFT area of the frame.",
+    "bottom-center":  "Place the board in the BOTTOM-CENTER area of the frame.",
+    "bottom-right":   "Place the board in the BOTTOM-RIGHT area of the frame.",
+}
+
+
+class LensCalibrationSession:
+    """
+    Manages a multi-step lens distortion calibration using a checkerboard.
+
+    Usage:
+        session = LensCalibrationSession(rows=9, cols=6, square_mm=25)
+        session.start()
+        while not session.can_finish:
+            result = session.capture(frame)   # returns guidance dict
+        report = session.finish(calibration_service)
+    """
+
+    MIN_CAPTURES = 10
+    MAX_CAPTURES = 20
+    MIN_ZONES    = 5
+
+    def __init__(self, rows: int = 9, cols: int = 6, square_mm: float = 25.0):
+        self.rows = rows
+        self.cols = cols
+        self.square_mm = square_mm
+        self.session_id = str(uuid.uuid4())
+
+        # Accumulated data
+        self.obj_points_list: List[np.ndarray] = []   # 3-D world points
+        self.img_points_list: List[np.ndarray] = []   # 2-D image points
+        self.image_size: Optional[Tuple[int, int]] = None
+
+        # Zone tracking
+        self.zones_hit: Dict[str, int] = {}  # zone_name → capture count
+        self.capture_count = 0
+        self.last_preview: Optional[np.ndarray] = None
+
+        # Pre-compute the 3-D object points for one checkerboard view
+        self._obj_pts = np.zeros((rows * cols, 3), np.float32)
+        self._obj_pts[:, :2] = np.mgrid[0:rows, 0:cols].T.reshape(-1, 2)
+        self._obj_pts *= square_mm  # scale to physical mm
+
+        self.active = False
+
+    def start(self) -> Dict:
+        """Begin the calibration session."""
+        self.active = True
+        return self._status(instruction=self._next_instruction())
+
+    def capture(self, frame: np.ndarray) -> Dict:
+        """Attempt to detect the checkerboard in `frame`."""
+        if not self.active:
+            return {"error": "No active session. Call /start first."}
+
+        if self.capture_count >= self.MAX_CAPTURES:
+            return self._status(
+                success=False,
+                message="Maximum captures reached. Call /finish to compute calibration.",
+            )
+
+        h, w = frame.shape[:2]
+        self.image_size = (w, h)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        flags = (
+            cv2.CALIB_CB_ADAPTIVE_THRESH
+            | cv2.CALIB_CB_NORMALIZE_IMAGE
+            | cv2.CALIB_CB_FAST_CHECK
+        )
+        found, corners = cv2.findChessboardCorners(gray, (self.rows, self.cols), flags)
+
+        if not found:
+            self._save_preview(frame, None)
+            return self._status(
+                success=False,
+                message="Checkerboard not detected. Ensure the full board is visible "
+                        "and evenly lit. Avoid glare and shadows.",
+            )
+
+        # Sub-pixel refinement
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+        corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+
+        # Determine which zone the board center falls in
+        center = corners.mean(axis=0).flatten()
+        zone = self._classify_zone(center, w, h)
+
+        # Store
+        self.obj_points_list.append(self._obj_pts.copy())
+        self.img_points_list.append(corners)
+        self.capture_count += 1
+        self.zones_hit[zone] = self.zones_hit.get(zone, 0) + 1
+
+        self._save_preview(frame, corners)
+
+        return self._status(
+            success=True,
+            zone_hit=zone,
+            message=f"Capture #{self.capture_count} — board detected in '{zone}'.",
+            instruction=self._next_instruction(),
+        )
+
+    @property
+    def can_finish(self) -> bool:
+        return (
+            self.capture_count >= self.MIN_CAPTURES
+            and len(self.zones_hit) >= self.MIN_ZONES
+        )
+
+    def finish(self, cal_service: 'CalibrationService') -> Dict:
+        """Compute the lens calibration and save it."""
+        if self.capture_count < 4:
+            return {"error": "Need at least 4 captures to calibrate."}
+
+        w, h = self.image_size
+        is_fisheye = cal_service.is_fisheye
+
+        if is_fisheye:
+            # Kannala-Brandt fisheye model (4 coefficients)
+            K = np.eye(3, dtype=np.float64)
+            D = np.zeros((4, 1), dtype=np.float64)
+            flags = (
+                cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
+                | cv2.fisheye.CALIB_CHECK_COND
+                | cv2.fisheye.CALIB_FIX_SKEW
+            )
+            criteria = (
+                cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6
+            )
+            # fisheye.calibrate expects obj_points as list of (N,1,3)
+            obj_pts = [p.reshape(-1, 1, 3) for p in self.obj_points_list]
+            img_pts = [p.reshape(-1, 1, 2) for p in self.img_points_list]
+
+            rms, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
+                obj_pts, img_pts, (w, h), K, D,
+                flags=flags, criteria=criteria,
+            )
+            D = D.flatten()
+            model = "fisheye"
+        else:
+            # Standard pinhole + radial/tangential (5 coefficients)
+            rms, K, D, rvecs, tvecs = cv2.calibrateCamera(
+                self.obj_points_list, self.img_points_list, (w, h),
+                None, None,
+            )
+            D = D.flatten()
+            model = "standard"
+
+        logger.info(f"Lens calibration complete: model={model}, RMS={rms:.4f}")
+
+        cal_service._save_lens_calibration(
+            camera_matrix=K,
+            dist_coeffs=D,
+            rms_error=float(rms),
+            image_size=(w, h),
+            num_images=self.capture_count,
+            model=model,
+        )
+
+        self.active = False
+
+        return {
+            "status": "calibrated",
+            "model": model,
+            "rms_error": round(float(rms), 4),
+            "camera_matrix": K.tolist(),
+            "dist_coeffs": D.tolist(),
+            "captures_used": self.capture_count,
+            "zones_covered": list(self.zones_hit.keys()),
+            "note": (
+                "Lens calibration saved. You should now re-run the AprilTag "
+                "homography calibration (POST /api/lens/calibrate) since "
+                "undistortion changes pixel positions."
+            ),
+        }
+
+    # ── Private helpers ────────────────────────────────────────────────────
+
+    def _classify_zone(self, center: np.ndarray, w: int, h: int) -> str:
+        """Map a point to one of the 9 grid zones."""
+        cx, cy = center
+        col = 0 if cx < w / 3 else (1 if cx < 2 * w / 3 else 2)
+        row = 0 if cy < h / 3 else (1 if cy < 2 * h / 3 else 2)
+        return _ZONE_NAMES[row * 3 + col]
+
+    def _next_instruction(self) -> str:
+        """Generate the next placement instruction based on zone coverage."""
+        if self.capture_count == 0:
+            return (
+                "Hold the printed checkerboard flat in front of the camera. "
+                "Start by placing it in the CENTER of the frame."
+            )
+
+        # Find uncovered zones
+        uncovered = [z for z in _ZONE_NAMES if z not in self.zones_hit]
+        if uncovered:
+            target = uncovered[0]
+            base = _ZONE_INSTRUCTIONS[target]
+        else:
+            # All zones covered — ask for a tilted view
+            target = _ZONE_NAMES[self.capture_count % len(_ZONE_NAMES)]
+            base = (
+                f"All zones covered! For extra accuracy, tilt the board "
+                f"~15° and place it in the {target.upper()} area."
+            )
+
+        remaining = max(0, self.MIN_CAPTURES - self.capture_count)
+        if remaining > 0:
+            base += f" ({remaining} more capture(s) needed)"
+        elif self.can_finish:
+            base += " (You can now call /finish, or keep adding captures for better accuracy.)"
+
+        return base
+
+    def _save_preview(self, frame: np.ndarray, corners: Optional[np.ndarray]) -> None:
+        """Save a preview image with detected corners drawn."""
+        preview = frame.copy()
+        if corners is not None:
+            cv2.drawChessboardCorners(preview, (self.rows, self.cols), corners, True)
+        # Draw 3×3 zone grid
+        h, w = preview.shape[:2]
+        for i in range(1, 3):
+            cv2.line(preview, (w * i // 3, 0), (w * i // 3, h), (100, 100, 100), 1)
+            cv2.line(preview, (0, h * i // 3), (w, h * i // 3), (100, 100, 100), 1)
+        # Downscale for manageable file size
+        MAX_W = 1280
+        if w > MAX_W:
+            s = MAX_W / w
+            preview = cv2.resize(preview, (int(w * s), int(h * s)))
+        self.last_preview = preview
+        debug_path = "calibration_data/lens_calibration_preview.jpg"
+        os.makedirs(os.path.dirname(debug_path), exist_ok=True)
+        cv2.imwrite(debug_path, preview)
+
+    def _status(self, **extra) -> Dict:
+        """Build a status response dict."""
+        return {
+            "session_id": self.session_id,
+            "captures_done": self.capture_count,
+            "total_target": self.MIN_CAPTURES,
+            "max_captures": self.MAX_CAPTURES,
+            "zones_covered": list(self.zones_hit.keys()),
+            "zones_remaining": [
+                z for z in _ZONE_NAMES if z not in self.zones_hit
+            ],
+            "can_finish": self.can_finish,
+            "preview_url": "/api/lens/calibrate-lens/preview",
+            **extra,
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AprilTag Generator
+# ──────────────────────────────────────────────────────────────────────────────
 
 class AprilTagGenerator:
     @staticmethod

@@ -57,7 +57,7 @@ This approach detects workpieces of **any brightness** — bright wood, white pa
 | `VISION_CAMERA_ID` | `0` | OpenCV camera index (used when Picamera2 is unavailable). |
 | `CAMERA_RESOLUTION` | `max` | Capture resolution. `max` uses the sensor's full native resolution. Override with `WIDTHxHEIGHT` (e.g. `1920x1080`). |
 | `CAMERA_HDR` | `False` | Enable sensor-level hardware HDR (IMX708/Camera v3 only). Caps resolution to ~3MP (2304×1296). |
-| `FISHEYE_LENS` | `False` | Apply fisheye undistortion (requires manual K/D coefficient tuning). Not needed for the IMX708 102° lens. |
+| `FISHEYE_LENS` | `False` | Lens distortion model. `False` = standard pinhole (≤120° HFOV). `True` = Kannala-Brandt fisheye (>140° HFOV). Used during guided lens calibration. |
 | `WORKSPACE_HEIGHT_MM` | `500` | Physical height of the laser bed in mm. Used to flip the Y-axis so (0,0) is bottom-left. Set to `0` to disable Y-flip. |
 
 ### Auto-Exposure Settling
@@ -106,16 +106,26 @@ The detection pipeline downsamples the camera frame to a capped working resoluti
 - **`GET /api/apriltag/batch`** — Returns a multi-page PDF of tags densely packed for printing.
   - Params: `start_id`, `count`, `size_mm`, `dpi`, `paper_width_in`, `paper_height_in`
 
-### 2. Calibration
+### 2. Lens Distortion Calibration (Guided)
+- **`GET /api/lens/checkerboard/generate`** — Generate a printable checkerboard PDF for lens calibration.
+  - Params: `rows` (default 9), `cols` (default 6), `square_mm` (default 25), `dpi` (default 300)
+- **`POST /api/lens/calibrate-lens/start`** — Start a guided lens calibration session.
+  - Params: `rows`, `cols`, `square_mm` (must match your printed checkerboard)
+- **`POST /api/lens/calibrate-lens/capture`** — Capture a frame and detect the checkerboard. Returns placement guidance for the next capture.
+- **`POST /api/lens/calibrate-lens/finish`** — Compute and save the lens calibration (K/D coefficients).
+- **`GET /api/lens/calibrate-lens/status`** — Get session progress or saved calibration status.
+- **`GET /api/lens/calibrate-lens/preview`** — Preview image from the last capture attempt with detected corners drawn.
+
+### 3. Homography Calibration (AprilTags)
 - **`POST /api/lens/calibrate`** — Calibrates the camera using detected AprilTags and their known physical positions.
   ```json
   { "tags": [{"id": 0, "physical_x": 0, "physical_y": 0, "size_mm": 20, "anchor": "center"}] }
   ```
 - **`GET /api/lens/calibration`** — Returns the current calibration status, stored homography matrix, and tag metadata.
-- **`GET /api/lens/calibration/check`** — Live quality check. Detects visible AprilTags in the current frame and returns per-tag reprojection error in mm. Saves a debug image viewable at `/api/lens/calibration/debug-image`.
+- **`GET /api/lens/calibration/check`** — Live quality check. Detects visible AprilTags in the current frame and returns per-tag reprojection error in mm.
 
-### 3. Detection
-- **`GET /api/lens/detect`** — Returns all detected workpieces with physical boundaries, segmentation polygon, orientation angle, and area. Saves a debug image viewable at `/api/lens/detect/debug-image`.
+### 4. Detection
+- **`GET /api/lens/detect`** — Returns all detected workpieces with physical boundaries, segmentation polygon, orientation angle, and area.
   ```json
   {
     "workpieces": [
@@ -135,11 +145,11 @@ The detection pipeline downsamples the camera frame to a capped working resoluti
 - **`GET /api/lens/stream`** — Real-time MJPEG preview stream (~25 FPS).
 - **`GET /api/lens/frame`** — Captures and returns a single JPEG frame.
 
-### 4. Debug Images
-- **`GET /api/lens/calibration/debug-image`** — Returns the annotated debug JPEG from the last calibration check.
-- **`GET /api/lens/detect/debug-image`** — Returns the annotated debug JPEG from the last detection run.
+### 5. Debug Images
+- **`GET /api/lens/calibration/debug-image`** — Annotated debug JPEG from the last calibration check.
+- **`GET /api/lens/detect/debug-image`** — Annotated debug JPEG from the last detection run.
 
-### 5. Transformation (Tap-to-Place)
+### 6. Transformation (Tap-to-Place)
 - **`POST /api/lens/transform`** — Calculates alignment parameters for placing a design on a detected workpiece.
   - **Inputs**: `workpiece_id`, plus either `design_width_mm`/`design_height_mm` OR `design_file` + `dpi`.
   - **Returns**: Rotation (deg), Scale, and Translation (mm).
@@ -193,10 +203,26 @@ uvicorn app.main:app --port 8001 --reload
 
 ## Calibration Workflow
 
+Calibration is a two-stage process. Lens calibration is a **one-time** setup per camera. AprilTag calibration should be re-run whenever the camera or tags are moved.
+
+### Stage 1: Lens Distortion Calibration (one-time)
+
+1. **Print checkerboard**: `GET /api/lens/checkerboard/generate` → print the PDF at 100% scale.
+2. **Tape to flat surface**: Attach the printout to a rigid flat surface (clipboard, book, cardboard).
+3. **Start session**: `POST /api/lens/calibrate-lens/start`
+4. **Capture frames**: Hold the checkerboard in front of the camera and call `POST /api/lens/calibrate-lens/capture`. The API returns guidance on where to place the board next (9 zones across the frame).
+5. **Repeat** for 10–15 captures, covering at least 5 zones and varying the board angle slightly.
+6. **Finish**: `POST /api/lens/calibrate-lens/finish` → computes K/D coefficients and saves them to `calibration_data/lens_calibration.json`.
+7. The calibration persists across restarts. You only need to redo this if you change the camera or lens.
+
+### Stage 2: AprilTag Homography Calibration
+
 1. **Print AprilTags**: Use `/api/apriltag/batch` to download a PDF of tags. Print tags `0`–`3` (or more) and attach them to the four corners of your laser bed.
 2. **Measure positions**: Note the physical X, Y position of each tag's center (or corner, depending on your `anchor` setting) in mm relative to your bed's (0,0) origin.
 3. **Calibrate**: POST to `/api/lens/calibrate` with the tag IDs and their measured physical positions.
-4. **Verify**: GET `/api/lens/calibration/check` and inspect the `per_tag_errors`. A `mean_error_mm` under 5mm is considered good. Download the debug image to visually inspect tag detection.
+4. **Verify**: GET `/api/lens/calibration/check` and inspect the `per_tag_errors`. A `mean_error_mm` under 5mm is considered good.
+
+> **Important:** Always run the lens calibration (Stage 1) **before** the AprilTag calibration (Stage 2). Undistortion changes pixel positions, so the homography must be computed on undistorted images.
 
 ---
 
