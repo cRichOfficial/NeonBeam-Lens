@@ -830,21 +830,17 @@ class AprilTagGenerator:
         footer_h   = tag_gap + text_row_h + unit
 
         if guide_distance_mm > 0.0:
-            guide_px = int((guide_distance_mm / 25.4) * dpi)
-            min_half = size_px // 2 + unit
-            if guide_px < min_half:
-                guide_px = min_half
-                
-            center_x = guide_px
-            center_y = guide_px
-            cut_w = 2 * guide_px
-            cut_h = 2 * guide_px
-            
+            # guide_distance_mm = white margin from the tag edge to the cut-guide border.
+            # e.g. 20mm tag with 5mm guide → border is 5mm outside the tag on all sides.
+            guide_offset_px = max(1, int((guide_distance_mm / 25.4) * dpi))
+
+            tag_x = guide_offset_px
+            tag_y = guide_offset_px
+            cut_w = size_px + 2 * guide_offset_px
+            cut_h = size_px + 2 * guide_offset_px
+
             total_w = cut_w
-            total_h = cut_h + footer_h  # Add space below cut guide for text
-            
-            tag_x = center_x - size_px // 2
-            tag_y = center_y - size_px // 2
+            total_h = cut_h + footer_h  # text footer sits below the cut guide
         else:
             total_w = size_px + 2 * unit
             total_h = size_px + top_gap + footer_h
