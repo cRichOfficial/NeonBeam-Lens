@@ -302,15 +302,18 @@ class InferenceService:
 
     def _software_detect(self, image: np.ndarray) -> List[Dict]:
         """
-        OpenCV-based fallback detector optimized for a black honeycomb laser bed.
+        OpenCV-based fallback detector for a black honeycomb laser bed.
 
-        Uses morphological Top-Hat transforms to reliably find objects (bright or
-        dark) regardless of their size relative to the blur kernel.
+        Detection strategy: the honeycomb background is always very dark.
+        We estimate the background brightness from the 30th percentile of
+        in-bed pixels (the dark honeycomb dominates the distribution even
+        with a large workpiece present) and threshold anything significantly
+        brighter as a candidate workpiece.
 
-        Performance: all expensive operations are performed on a downsampled
-        working image (capped at DETECT_MAX_DIM on the long side, default 1280px).
+        Performance: all expensive operations run on a downsampled working
+        image (capped at DETECT_MAX_DIM on the long side, default 1280px).
         Contour coordinates are scaled back to full resolution before the
-        homography mapping so physical mm values remain accurate.
+        homography maps them to physical mm values.
         """
         orig_h, orig_w = image.shape[:2]
 
@@ -344,15 +347,11 @@ class InferenceService:
             return n if n % 2 == 1 else n + 1
 
         smooth_k    = odd(11 * scale)   # removes honeycomb dot texture
-        tophat_k    = odd(45 * scale)   # SE > honeycomb hole, < smallest workpiece
         morph_k     = odd(self.honeycomb_kernel * scale)
         tag_pad     = int(self.apriltag_mask_padding * scale)
         min_area_px = max(100, int(1000 * scale * scale))
 
-        logger.debug(
-            f"Kernels at scale={scale:.2f}: smooth={smooth_k}, "
-            f"tophat={tophat_k}, morph={morph_k}"
-        )
+        logger.debug(f"Kernels at scale={scale:.2f}: smooth={smooth_k}, morph={morph_k}")
 
         # 1. Grayscale
         gray = cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY)
@@ -390,29 +389,36 @@ class InferenceService:
             expanded = centroid + (corners - centroid) * scale_f
             cv2.fillPoly(mask_roi, [expanded.astype(np.int32)], 0)
 
-        # 6. Morphological Top-Hat transforms
-        #    White Top-Hat = bright objects on dark background (wood, acrylic)
-        #    Black Top-Hat = dark objects on bright background (slate, metal)
-        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (tophat_k, tophat_k))
-        white_tophat = cv2.morphologyEx(smoothed, cv2.MORPH_TOPHAT,  se)
-        black_tophat = cv2.morphologyEx(smoothed, cv2.MORPH_BLACKHAT, se)
-        combined = cv2.add(white_tophat, black_tophat)
-
-        # 7. Restrict to ROI, then normalise only in-bed pixels
-        in_bed = cv2.bitwise_and(combined, combined, mask=mask_roi)
-
-        roi_pixels = in_bed[mask_roi > 0]
-        if len(roi_pixels) == 0 or roi_pixels.max() == 0:
-            logger.warning("No signal detected in bed ROI.")
+        # 6. Percentile-based background thresholding
+        #
+        #    The honeycomb bed is always dark (post-CLAHE typically 30-80 gray).
+        #    It covers >60% of the ROI even with a large workpiece present,
+        #    so the 30th percentile of in-ROI pixel values gives a stable,
+        #    scene-adaptive background level estimate.
+        #
+        #    Any workpiece (wood, acrylic, card) is significantly brighter.
+        #    We threshold at bg_level + an adaptive margin.
+        in_bed_vals = smoothed[mask_roi > 0]
+        if len(in_bed_vals) == 0:
+            logger.warning("ROI is empty — cannot detect objects.")
             return []
 
-        p99 = float(np.percentile(roi_pixels, 99))
-        if p99 > 0:
-            norm = np.clip(in_bed.astype(np.float32) * (255.0 / p99), 0, 255).astype(np.uint8)
-        else:
-            norm = in_bed
+        bg_level = float(np.percentile(in_bed_vals, 30))
+        # Adaptive threshold: bg + max(fixed floor, 30% of bg value)
+        # On a dark bed (bg~50): threshold ~75.  Wood tile is typically 130-200.
+        thresh_val = bg_level + max(25.0, bg_level * 0.3)
+        thresh_val = min(thresh_val, 240.0)  # safety cap
 
-        _, thresh = cv2.threshold(norm, 38, 255, cv2.THRESH_BINARY)
+        logger.debug(
+            f"BG estimate (p30): {bg_level:.1f}, "
+            f"threshold: {thresh_val:.1f}, "
+            f"ROI max: {float(in_bed_vals.max()):.1f}, "
+            f"ROI mean: {float(in_bed_vals.mean()):.1f}"
+        )
+
+        # Build binary mask: bright pixels inside ROI
+        bright = (smoothed > thresh_val).astype(np.uint8) * 255
+        thresh = cv2.bitwise_and(bright, bright, mask=mask_roi)
 
         # 8. Morphological Closing — bridges intra-workpiece gaps
         morph_se = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_k, morph_k))
