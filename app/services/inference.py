@@ -524,7 +524,16 @@ class InferenceService:
         from .calibration import calibration_service
         image = calibration_service.undistort(image)
 
-        # Prepare debug drawing
+        # Log frame brightness so dark/underexposed frames are immediately visible
+        mean_brightness = float(np.mean(image))
+        logger.debug(f"Input frame mean brightness: {mean_brightness:.1f}")
+        if mean_brightness < 15:
+            logger.warning(
+                f"Input frame is very dark (mean={mean_brightness:.1f}). "
+                "Camera may still be settling AE — detection results may be unreliable."
+            )
+
+        # Prepare debug drawing on the raw frame
         debug_img = image.copy()
 
         if self.use_hailo:
@@ -541,22 +550,52 @@ class InferenceService:
             pts = np.array(wp['corners_px'], dtype=np.int32)
             mm_pts = wp['corners_mm']
             cv2.polylines(debug_img, [pts], True, (0, 255, 0), 2)
-            
-            # Label the ID at the top
+
             label = f"{wp['id']}"
             cv2.putText(debug_img, label, (pts[0][0], pts[0][1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            # Label each individual corner with its physical (X, Y)
             for i, (px, mm) in enumerate(zip(pts, mm_pts)):
                 mm_label = f"({int(mm[0])},{int(mm[1])})"
                 cv2.putText(debug_img, mm_label, (px[0], px[1]),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
-        # Save debug image
+        # ── Composite diagnostic debug image ─────────────────────────────────
+        # Panel A (left):  raw camera frame with detection overlays
+        # Panel B (right): processed grayscale used by the detector
+        # Saves at a fixed output width to keep file size manageable.
         debug_path = "calibration_data/detect_debug.jpg"
         os.makedirs(os.path.dirname(debug_path), exist_ok=True)
-        cv2.imwrite(debug_path, debug_img)
+        try:
+            MAX_DEBUG_W = 1280
+            h, w = debug_img.shape[:2]
+            scale = min(1.0, MAX_DEBUG_W / w)
+            th = int(h * scale)
+            tw = int(w * scale)
+
+            panel_a = cv2.resize(debug_img, (tw, th))
+
+            # Build a grayscale visualisation of what the detector worked on
+            gray_proc = cv2.cvtColor(
+                cv2.resize(image, (tw, th)), cv2.COLOR_BGR2GRAY
+            )
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            gray_proc = clahe.apply(gray_proc)
+            panel_b = cv2.cvtColor(gray_proc, cv2.COLOR_GRAY2BGR)
+
+            # Add panel labels
+            label_args = dict(fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.7,
+                              color=(0, 255, 255), thickness=2)
+            cv2.putText(panel_a, f"RAW  mean={mean_brightness:.0f}",
+                        (10, 30), **label_args)
+            cv2.putText(panel_b, "CLAHE gray (detector input)",
+                        (10, 30), **label_args)
+
+            composite = np.hstack([panel_a, panel_b])
+            cv2.imwrite(debug_path, composite)
+        except Exception as e:
+            logger.warning(f"Failed to save composite debug image: {e}")
+            cv2.imwrite(debug_path, debug_img)
 
         return results
 

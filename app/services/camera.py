@@ -164,7 +164,43 @@ class CameraService:
             time.sleep(0.01)
 
     def get_frame(self):
-        """Return the most recent frame."""
+        """Return the most recent frame, waiting briefly for AE to settle if needed.
+
+        The IMX708 (and most Pi cameras) need several frames after startup or
+        after an exposure change for auto-exposure to stabilize.  If the returned
+        frame is abnormally dark (mean brightness below MIN_FRAME_BRIGHTNESS) we
+        spin up to AE_SETTLE_RETRIES times waiting AE_SETTLE_DELAY seconds each,
+        giving the ISP time to produce a well-exposed frame.
+        """
+        min_brightness = float(os.getenv("MIN_FRAME_BRIGHTNESS", "20"))
+        max_retries    = int(os.getenv("AE_SETTLE_RETRIES", "10"))
+        delay          = float(os.getenv("AE_SETTLE_DELAY", "0.1"))
+
+        for attempt in range(max_retries):
+            frame = self.last_frame
+            if frame is None:
+                time.sleep(delay)
+                continue
+
+            mean_brightness = float(np.mean(frame))
+            if mean_brightness >= min_brightness:
+                if attempt > 0:
+                    logger.info(
+                        f"AE settled after {attempt} retries "
+                        f"(mean brightness: {mean_brightness:.1f})"
+                    )
+                return frame
+
+            logger.debug(
+                f"Frame too dark (mean={mean_brightness:.1f} < {min_brightness}), "
+                f"retrying AE settle ({attempt+1}/{max_retries})..."
+            )
+            time.sleep(delay)
+
+        logger.warning(
+            f"Frame still dark after {max_retries} retries — returning anyway. "
+            "Check camera exposure settings."
+        )
         return self.last_frame
 
     def get_jpeg_frame(self):
@@ -172,7 +208,7 @@ class CameraService:
         frame = self.get_frame()
         if frame is None:
             return None
-        
+
         ret, buffer = cv2.imencode('.jpg', frame)
         if not ret:
             return None
