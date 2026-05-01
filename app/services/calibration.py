@@ -87,16 +87,24 @@ class CalibrationService:
         except Exception as e:
             logger.error(f"Failed to save calibration: {e}")
 
-    def detect_tags(self, image: np.ndarray) -> List[Dict]:
-        """Detect AprilTags in the image. Automatically undistorts if enabled."""
-        # Ensure we are working with an undistorted image for tag detection
-        img_processed = self.undistort(image)
-        
+    def detect_tags(self, image: np.ndarray, apply_undistort: bool = True) -> List[Dict]:
+        """
+        Detect AprilTags in the image.
+
+        Args:
+            image: Input frame (BGR numpy array).
+            apply_undistort: If True (default), applies fisheye undistortion
+                before detection when FISHEYE_LENS is enabled. Pass False when
+                the caller has already undistorted the frame to avoid processing
+                the image twice.
+        """
+        img_processed = self.undistort(image) if apply_undistort else image
+
         corners, ids, rejected = self.detector.detectMarkers(img_processed)
         results = []
         if ids is not None:
             for i, tag_id in enumerate(ids.flatten()):
-                tag_corners = corners[i][0] # 4x2 array of corners
+                tag_corners = corners[i][0]  # 4x2 array of corners
                 results.append({
                     "id": int(tag_id),
                     "corners": tag_corners.tolist()
@@ -200,18 +208,16 @@ class CalibrationService:
         return None
 
     def undistort(self, image: np.ndarray) -> np.ndarray:
-        """Apply fisheye undistortion if enabled."""
-        if not self.is_fisheye or hasattr(image, '_neon_undistorted'):
+        """Apply fisheye undistortion if FISHEYE_LENS is enabled, otherwise no-op."""
+        if not self.is_fisheye:
             return image
-        
+
         h, w = image.shape[:2]
-        # Estimate new camera matrix to keep the full FOV
-        new_k = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(self.k, self.d, (w, h), np.eye(3), balance=1.0)
-        undistorted = cv2.fisheye.undistortImage(image, self.k, self.d, Knew=new_k)
-        
-        # Mark as processed to prevent double-undistortion
-        setattr(undistorted, '_neon_undistorted', True)
-        return undistorted
+        # Estimate a new camera matrix that retains the full FOV after correction
+        new_k = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            self.k, self.d, (w, h), np.eye(3), balance=1.0
+        )
+        return cv2.fisheye.undistortImage(image, self.k, self.d, Knew=new_k)
 
     def map_pixels_to_mm(self, points_px: np.ndarray) -> np.ndarray:
         """Transform pixel coordinates to physical mm using the calibration homography.

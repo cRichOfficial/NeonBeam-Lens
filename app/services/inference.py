@@ -363,7 +363,8 @@ class InferenceService:
         #    so the aluminum frame and surrounding table cannot compress the
         #    in-bed contrast range.
         from .calibration import calibration_service
-        tags = calibration_service.detect_tags(image)
+        # image is already undistorted by detect_workpieces() — skip second pass
+        tags = calibration_service.detect_tags(image, apply_undistort=False)
 
         mask_roi = np.zeros(smoothed.shape, dtype=np.uint8)
         if len(tags) >= 3:
