@@ -221,32 +221,53 @@ class InferenceService:
         # Restrict to ROI
         raw_mask = cv2.bitwise_and(raw_mask, raw_mask, mask=mask_roi)
 
-        # ── 5. Hull-fill each initial blob ────────────────────────────────────
+        # ── 5. Combined convex hull of all valid fragments ────────────────────
         #
-        #  The threshold mask may only cover 60-80% of the workpiece (e.g. a
-        #  textured wood piece that partially matches the reference).  Taking
-        #  the convex hull of each valid blob naturally fills the gaps —
-        #  a partially-visible rectangle's hull is still a good rectangle.
+        #  Wood grain / uneven lighting splits the threshold mask into several
+        #  disconnected blobs.  If we hull each blob individually the result
+        #  is several small hulls that don't cover the whole piece.
         #
-        #  We only accept blobs that are above a minimum pixel area; this
-        #  removes single-cell honeycomb artefacts before the expensive hull step.
+        #  Solution: combine all valid fragment points into ONE point cloud and
+        #  take a single convex hull.  Even if grain cuts the piece into three
+        #  fragments the combined hull spans from the top-left fragment to the
+        #  bottom-right fragment — giving the correct overall extent.
+        #
+        #  Fragments below min_area * 0.1 are still accepted as contributors
+        #  (they help define the outer boundary) but below min_area * 0.05 are
+        #  pure noise and ignored.
 
         init_cnts, _ = cv2.findContours(
             raw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        hull_mask = np.zeros((proc_h, proc_w), dtype=np.uint8)
+        fragment_pts = []
         for cnt in init_cnts:
-            if cv2.contourArea(cnt) < min_area:
-                continue
-            hull = cv2.convexHull(cnt)
-            cv2.fillPoly(hull_mask, [hull], 255)
+            if cv2.contourArea(cnt) >= max(min_area * 0.05, 30):
+                fragment_pts.append(cnt.reshape(-1, 2))
 
-        # ── 6. Morphological close to smooth hull edges and merge fragments ───
-        close_k  = self._odd(morph_k * 2)   # ~2 cell diameters
+        hull_mask = np.zeros((proc_h, proc_w), dtype=np.uint8)
+        if fragment_pts:
+            combined_pts  = np.vstack(fragment_pts)
+            combined_hull = cv2.convexHull(combined_pts)
+            cv2.fillPoly(hull_mask, [combined_hull], 255)
+
+        # ── 6. Edge-pad dilation + morphological close ────────────────────────
+        #
+        #  The combined hull may still fall short of the real workpiece boundary
+        #  if the threshold missed a dark-grained ring around the edges.
+        #  DETECT_EDGE_PAD_PX (default = morph_k) expands the hull outward to
+        #  cover those missed edge pixels before the final close.
+        edge_pad = int(os.getenv("DETECT_EDGE_PAD_PX", str(morph_k)))
+        if edge_pad > 0:
+            pad_se   = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (self._odd(edge_pad), self._odd(edge_pad))
+            )
+            hull_mask = cv2.dilate(hull_mask, pad_se, iterations=1)
+
+        close_k  = self._odd(morph_k * 2)
         close_se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
         candidate_mask = cv2.morphologyEx(hull_mask, cv2.MORPH_CLOSE, close_se)
 
-        # Restrict to ROI (the close might expand slightly outside)
+        # Restrict to ROI
         candidate_mask = cv2.bitwise_and(candidate_mask, candidate_mask, mask=mask_roi)
 
         # ── 7. Canny — diagnostic only ────────────────────────────────────────
