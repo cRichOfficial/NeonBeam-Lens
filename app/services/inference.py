@@ -289,105 +289,94 @@ class InferenceService:
         eroded  = cv2.erode(closed, boundary_se, iterations=1)
         dilated = cv2.dilate(eroded, boundary_se, iterations=2)
 
-        # ── 7. Candidate blobs from variance mask ────────────────────────────
-        var_contours, _ = cv2.findContours(
-            dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        logger.debug(f"Variance blobs before area filter: {len(var_contours)}")
+        # ── 7. Canny-first detection with diff+variance as location seed ─────
+        #
+        #   The old approach built a "ring" around the diff/variance blob and
+        #   looked for Canny edges only within that ring.  When the blob was
+        #   small or misplaced the ring never reached the actual workpiece
+        #   boundary, so detection was inaccurate.
+        #
+        #   New approach:
+        #     a) Run Canny across the full ROI (already shows the workpiece).
+        #     b) Dilate diff+variance signal aggressively → broad search zone.
+        #     c) Collect Canny contours WITHIN the search zone; fill them.
+        #     d) Also add diff+variance blobs as supplemental candidates.
+        #     e) Merge, re-find final contours, iterate those directly.
 
-        # ── 8. Edge-refinement stage ─────────────────────────────────────────
-        #
-        #   Strategy: run Canny on the lightly-smoothed CLAHE image, then
-        #   restrict it to a "boundary ring" built from the variance blob.
-        #
-        #   The ring is: dilate(blob) − blob  ← just the perimeter pixels.
-        #   Because the ring only covers the transition zone between the
-        #   workpiece and the bed, honeycomb edges (which are far outside
-        #   the blob) are never even considered by Canny.
-        #
-        #   This avoids the blur-vs-cell-edges arms race entirely.
-
-        # Light blur — just enough to reduce sensor noise for Canny
         canny_blur_k = self._odd(smooth_k)
         canny_blurred = cv2.GaussianBlur(enhanced, (canny_blur_k, canny_blur_k), 0)
-
         canny_high = float(os.getenv("DETECT_CANNY_HIGH", "60"))
         canny_low  = canny_high * 0.2
         canny_full = cv2.Canny(canny_blurred, canny_low, canny_high)
         canny_full = cv2.bitwise_and(canny_full, canny_full, mask=mask_roi)
 
-        # Build boundary ring around the morphologically cleaned mask
-        ring_k  = self._odd(large_k)   # ring width ~ one workpiece-merge kernel
-        ring_se = cv2.getStructuringElement(cv2.MORPH_RECT, (ring_k, ring_k))
-        blob_dilated = cv2.dilate(dilated, ring_se, iterations=1)
-        blob_ring    = cv2.subtract(blob_dilated, dilated)  # perimeter only
+        # Close Canny edges so that broken outlines form fill-able loops
+        gap_se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        canny_closed = cv2.dilate(canny_full, gap_se, iterations=2)
 
-        # Restrict Canny to the boundary ring — these are the workpiece edges
-        boundary_canny = cv2.bitwise_and(canny_full, canny_full, mask=blob_ring)
+        # Build search zone: dilate the combined diff+variance signal so that
+        # even a partial blob creates a region large enough to contain the
+        # actual workpiece boundary.  Fall back to the full ROI if no signal.
+        combined_signal = cv2.bitwise_or(diff_mask, var_mask_roi)
+        if cv2.countNonZero(combined_signal) > 0:
+            search_r = max(large_k * 4, int(min(proc_h, proc_w) * 0.20))
+            search_se = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (search_r * 2 + 1, search_r * 2 + 1)
+            )
+            search_zone = cv2.bitwise_and(
+                cv2.dilate(combined_signal, search_se), mask_roi
+            )
+        else:
+            search_zone = mask_roi.copy()
 
-        # Dilate boundary edges slightly to close any gaps in the outline
-        gap_se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        boundary_canny_closed = cv2.dilate(boundary_canny, gap_se, iterations=1)
+        canny_in_zone = cv2.bitwise_and(canny_closed, canny_closed, mask=search_zone)
 
-        # Store for debug panel D (show full Canny + ring overlay)
+        # Debug Panel E: full Canny; search zone pixels brightened
         debug_canny = canny_full.copy()
-        # Tint the active ring brighter so it's visible alongside the full map
-        debug_canny = np.where(blob_ring[..., None] > 0,
-                               np.full_like(debug_canny[..., None], 200),
-                               debug_canny[..., None]).squeeze()
-        debug_canny = debug_canny.astype(np.uint8)
+        debug_canny[search_zone > 0] = np.clip(
+            debug_canny[search_zone > 0].astype(np.int32) + 80, 0, 255
+        ).astype(np.uint8)
+
+        # Collect candidates into a single mask
+        candidate_mask = np.zeros((proc_h, proc_w), dtype=np.uint8)
+
+        # (a) Filled interiors of Canny closed contours within search zone
+        canny_cnts, _ = cv2.findContours(
+            canny_in_zone, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        for cnt in canny_cnts:
+            area = cv2.contourArea(cnt)
+            if min_area <= area <= proc_w * proc_h * 0.45:
+                cv2.fillPoly(candidate_mask, [cnt], 255)
+
+        # (b) Diff+variance blobs from morphology as supplement/fallback
+        var_contours, _ = cv2.findContours(
+            dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        for cnt in var_contours:
+            if min_area <= cv2.contourArea(cnt) <= proc_w * proc_h * 0.45:
+                cv2.fillPoly(candidate_mask, [cnt], 255)
+
+        if cv2.countNonZero(candidate_mask) == 0:
+            logger.warning("No candidates — returning empty.")
+            empty = np.zeros((proc_h, proc_w), dtype=np.uint8)
+            return [], raw_var_mask, diff_mask, debug_canny, proc_w, proc_h
+
+        # Merge overlapping / nearby blobs so one workpiece = one contour
+        merge_se = cv2.getStructuringElement(cv2.MORPH_RECT, (large_k, large_k))
+        candidate_mask = cv2.morphologyEx(candidate_mask, cv2.MORPH_CLOSE, merge_se)
+        final_contours, _ = cv2.findContours(
+            candidate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        logger.debug(f"Final contours after merge: {len(final_contours)}")
 
         results = []
         from .calibration import calibration_service as cal
 
-        for i, var_cnt in enumerate(var_contours):
-            area_proc = cv2.contourArea(var_cnt)
-            if area_proc < min_area or area_proc > (proc_w * proc_h * 0.5):
+        for i, refined_cnt in enumerate(final_contours):
+            area_proc = cv2.contourArea(refined_cnt)
+            if area_proc < min_area or area_proc > proc_w * proc_h * 0.45:
                 continue
-
-            # Create a single-blob mask for this contour
-            single_blob = np.zeros((proc_h, proc_w), dtype=np.uint8)
-            cv2.fillPoly(single_blob, [var_cnt], 255)
-
-            # Build boundary ring for this specific blob
-            blob_ring_single = cv2.dilate(single_blob, ring_se, iterations=1)
-            blob_ring_single = cv2.subtract(blob_ring_single, single_blob)
-
-            # Canny edges restricted to this blob's boundary ring
-            region_edges = cv2.bitwise_and(
-                boundary_canny_closed, boundary_canny_closed, mask=blob_ring_single
-            )
-
-            edge_cnts, _ = cv2.findContours(
-                region_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-
-            # Pick the largest edge contour that is meaningful
-            best_edge_cnt = None
-            if edge_cnts:
-                edge_cnts_sorted = sorted(edge_cnts, key=cv2.contourArea, reverse=True)
-                candidate = edge_cnts_sorted[0]
-                if cv2.contourArea(candidate) >= min_area * 0.3:
-                    best_edge_cnt = candidate
-
-            if best_edge_cnt is not None:
-                # Combine the variance blob fill + the refined boundary contour
-                # so the final shape covers the full interior, not just the ring
-                refined_mask = single_blob.copy()
-                cv2.drawContours(refined_mask, [best_edge_cnt], -1, 255,
-                                 thickness=cv2.FILLED)
-                refined_cnts, _ = cv2.findContours(
-                    refined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                )
-                refined_cnt = max(refined_cnts, key=cv2.contourArea) \
-                    if refined_cnts else var_cnt
-                logger.debug(
-                    f"Blob {i}: edge-refined "
-                    f"({cv2.contourArea(best_edge_cnt):.0f} px² ring)"
-                )
-            else:
-                refined_cnt = var_cnt
-                logger.debug(f"Blob {i}: using variance blob (no boundary edges found)")
 
             # ── Scale to full-res and map to mm ─────────────────────────────
             if ds < 1.0:
