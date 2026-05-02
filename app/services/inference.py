@@ -124,7 +124,7 @@ class InferenceService:
                 f"using margin fallback ROI (margin={margin}px)"
             )
 
-        # Erase AprilTag squares + white paper backing
+        # Erase AprilTag squares + white paper backing from ROI
         for tag in tags_proc:
             corners = np.array(tag['corners'], dtype=np.float32)
             centroid = corners.mean(axis=0)
@@ -132,6 +132,14 @@ class InferenceService:
             expand = 1.0 + tag_pad / max(half_diag, 1.0)
             expanded = centroid + (corners - centroid) * expand
             cv2.fillPoly(mask_roi, [expanded.astype(np.int32)], 0)
+
+        # Erode ROI inward by tag_pad to avoid using pixels right at the hull
+        # boundary (they produce artificially low variance artefacts).
+        if tag_pad > 0:
+            erode_se = cv2.getStructuringElement(
+                cv2.MORPH_RECT, (tag_pad * 2 + 1, tag_pad * 2 + 1)
+            )
+            mask_roi = cv2.erode(mask_roi, erode_se, iterations=1)
 
         # ── 4. Local variance — texture-based detection ──────────────────────
         #    Variance = E[X²] − E[X]²   (two box filters, very fast)
@@ -149,10 +157,11 @@ class InferenceService:
             logger.warning("ROI is empty — cannot detect objects.")
             return []
 
-        # The honeycomb dominates the ROI (>60% of pixels), so its variance
-        # sits around the 60th percentile.
-        hc_baseline = float(np.percentile(roi_var, 60))
-        var_thresh = hc_baseline * 0.4  # solid surfaces are typically <40% of HC
+        # Use p70 of ROI variance as the honeycomb baseline — it captures more
+        # of the distribution and is less sensitive to partially-occluded cells.
+        # A solid workpiece is typically <25% of the honeycomb variance.
+        hc_baseline = float(np.percentile(roi_var, 70))   # was p60
+        var_thresh   = hc_baseline * 0.25                  # was 0.40
 
         logger.debug(
             f"Variance: HC baseline (p60)={hc_baseline:.1f}, "
@@ -164,11 +173,25 @@ class InferenceService:
         # Binary mask: low-variance pixels inside the ROI
         low_var = (local_var < var_thresh).astype(np.uint8) * 255
         workpiece_mask = cv2.bitwise_and(low_var, low_var, mask=mask_roi)
+        # Keep a copy of the raw threshold mask for the debug panel
+        raw_var_mask = workpiece_mask.copy()
 
-        # ── 6. Morphological close + dilate to merge fragments ───────────────
+        # ── 6. Two-pass morphology ───────────────────────────────────────────
+        #   Pass A ─ small close: fills honeycomb holes *within* a workpiece patch
         morph_se = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_k, morph_k))
-        closed  = cv2.morphologyEx(workpiece_mask, cv2.MORPH_CLOSE, morph_se)
-        dilated = cv2.dilate(closed, morph_se, iterations=1)
+        closed = cv2.morphologyEx(workpiece_mask, cv2.MORPH_CLOSE, morph_se)
+
+        #   Pass B ─ large close: merges fragments of the same workpiece
+        #   (kernel = 3× the honeycomb spacing to bridge gaps across the piece)
+        large_k = self._odd(morph_k * 3)
+        large_se = cv2.getStructuringElement(cv2.MORPH_RECT, (large_k, large_k))
+        closed = cv2.morphologyEx(closed, cv2.MORPH_CLOSE, large_se)
+
+        #   Erode boundary artefacts (thin fringe left by the ROI edge),
+        #   then dilate back to restore true workpiece size.
+        boundary_se = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_k, morph_k))
+        eroded  = cv2.erode(closed, boundary_se, iterations=1)
+        dilated = cv2.dilate(eroded, boundary_se, iterations=2)
 
         # ── 7. Find contours (proc-space) ────────────────────────────────────
         contours, _ = cv2.findContours(
@@ -245,17 +268,21 @@ class InferenceService:
         logger.info(
             f"Detection complete: {len(results)} workpiece(s) in {elapsed:.2f}s"
         )
-        return results
+        return results, raw_var_mask, proc_w, proc_h
 
     # ── Debug Image ────────────────────────────────────────────────────────────
 
     def _save_debug_image(
-        self, image: np.ndarray, results: List[Dict], mean_brightness: float
+        self, image: np.ndarray, results: List[Dict],
+        mean_brightness: float,
+        var_mask_proc: np.ndarray | None = None,
+        proc_w: int = 0, proc_h: int = 0,
     ) -> None:
         """
-        Save a 2-panel diagnostic composite:
-          Panel A (left)  — raw frame with detection overlays
-          Panel B (right) — CLAHE-enhanced grayscale (what the detector sees)
+        Save a 3-panel diagnostic composite:
+          Panel A (left)   — raw frame with detection overlays
+          Panel B (centre) — CLAHE-enhanced grayscale (detector input)
+          Panel C (right)  — raw variance threshold mask (before morphology)
         """
         debug_path = "calibration_data/detect_debug.jpg"
         os.makedirs(os.path.dirname(debug_path), exist_ok=True)
@@ -266,13 +293,11 @@ class InferenceService:
         for wp in results:
             pts = np.array(wp['corners_px'], dtype=np.int32)
             cv2.polylines(debug_img, [pts], True, (0, 255, 0), 2)
-
             cv2.putText(
                 debug_img, wp['id'],
                 (pts[0][0], pts[0][1] - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
             )
-
             for px, mm in zip(pts, wp['corners_mm']):
                 label = f"({int(mm[0])},{int(mm[1])})"
                 cv2.putText(
@@ -280,7 +305,6 @@ class InferenceService:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1
                 )
 
-        # Build composite
         try:
             MAX_W = 1280
             h, w = debug_img.shape[:2]
@@ -293,14 +317,28 @@ class InferenceService:
             clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
             panel_b = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
 
+            # Panel C: variance mask upscaled to match panel size
+            if var_mask_proc is not None and var_mask_proc.size > 0:
+                panel_c = cv2.cvtColor(
+                    cv2.resize(var_mask_proc, (tw, th), interpolation=cv2.INTER_NEAREST),
+                    cv2.COLOR_GRAY2BGR
+                )
+                # Tint low-variance (white) pixels cyan so workpiece pops
+                cyan_tint = np.zeros_like(panel_c)
+                cyan_tint[panel_c[:, :, 0] > 128] = [255, 255, 0]  # cyan = B+G
+                panel_c = cv2.addWeighted(panel_c, 0.4, cyan_tint, 0.6, 0)
+            else:
+                panel_c = np.zeros((th, tw, 3), dtype=np.uint8)
+
             lbl = dict(
                 fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.7,
                 color=(0, 255, 255), thickness=2,
             )
             cv2.putText(panel_a, f"RAW  mean={mean_brightness:.0f}", (10, 30), **lbl)
             cv2.putText(panel_b, "CLAHE gray (detector input)", (10, 30), **lbl)
+            cv2.putText(panel_c, "Variance mask (pre-morphology)", (10, 30), **lbl)
 
-            cv2.imwrite(debug_path, np.hstack([panel_a, panel_b]))
+            cv2.imwrite(debug_path, np.hstack([panel_a, panel_b, panel_c]))
         except Exception as e:
             logger.warning(f"Debug composite failed: {e}")
             cv2.imwrite(debug_path, debug_img)
@@ -330,9 +368,8 @@ class InferenceService:
                 "AE may still be settling — results may be unreliable."
             )
 
-        results = self._detect_objects(image)
-
-        self._save_debug_image(image, results, mean_brightness)
+        results, raw_var_mask, proc_w, proc_h = self._detect_objects(image)
+        self._save_debug_image(image, results, mean_brightness, raw_var_mask, proc_w, proc_h)
         return results
 
 
