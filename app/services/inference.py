@@ -1,4 +1,5 @@
 import os
+import math
 import time
 import cv2
 import logging
@@ -395,8 +396,26 @@ class InferenceService:
                 cnt_full = refined_cnt
 
             rect = cv2.minAreaRect(cnt_full)
-            corners_px = cv2.boxPoints(rect).astype(np.int32)
-            angle_deg  = float(rect[2])
+            corners_px = cv2.boxPoints(rect).astype(np.float32)
+
+            # Stable rotation angle from the longest edge of the rotated rect.
+            # cv2.minAreaRect angle conventions changed across OpenCV versions
+            # ([-90,0) vs [0,90)) and depend on which side is "width" vs "height".
+            # Computing from boxPoints is version-agnostic.
+            #
+            # boxPoints returns corners in bottom-left → bottom-right → top-right → top-left
+            # order.  We pick the longest edge to represent the workpiece's long axis.
+            edges = [
+                corners_px[1] - corners_px[0],  # bottom edge
+                corners_px[2] - corners_px[1],  # right edge
+            ]
+            long_edge = max(edges, key=lambda e: float(e[0]**2 + e[1]**2))
+            angle_deg = math.degrees(math.atan2(float(long_edge[1]), float(long_edge[0])))
+            # Normalise to [-45, 45]: a rectangle at +46° is the same as -44°
+            while angle_deg >  45.0: angle_deg -= 90.0
+            while angle_deg < -45.0: angle_deg += 90.0
+
+            corners_px = corners_px.astype(np.int32)
 
             hull = cv2.convexHull(cnt_full)
             seg_px = hull.reshape(-1, 2).tolist()
@@ -467,10 +486,19 @@ class InferenceService:
         for wp in results:
             pts = np.array(wp['corners_px'], dtype=np.int32)
             cv2.polylines(debug_img, [pts], True, (0, 255, 0), 2)
+
+            # Centroid
+            cx = int(pts[:, 0].mean());  cy = int(pts[:, 1].mean())
+
+            # Angle label + rotation arrow from centroid along long axis
+            angle_r = math.radians(wp.get('angle_deg', 0))
+            ax = int(cx + 40 * math.cos(angle_r))
+            ay = int(cy + 40 * math.sin(angle_r))
+            cv2.arrowedLine(debug_img, (cx, cy), (ax, ay), (0, 128, 255), 2, tipLength=0.3)
             cv2.putText(
-                debug_img, wp['id'],
+                debug_img, f"{wp['id']}  {wp.get('angle_deg', 0):.1f}\u00b0",
                 (pts[0][0], pts[0][1] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 128, 255), 2
             )
             for px, mm in zip(pts, wp['corners_mm']):
                 label = f"({int(mm[0])},{int(mm[1])})"
