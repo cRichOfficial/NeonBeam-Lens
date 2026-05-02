@@ -187,63 +187,119 @@ class InferenceService:
         # Keep a copy of the raw threshold mask for the debug panel
         raw_var_mask = workpiece_mask.copy()
 
-        # ── 6. Two-pass morphology ───────────────────────────────────────────
-        #   Pass A ─ small close: fills honeycomb holes *within* a workpiece patch
+        # ── 6. Two-pass morphology on variance mask ──────────────────────────
+        #   Pass A — small close: fills individual cell holes within a blob
         morph_se = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_k, morph_k))
         closed = cv2.morphologyEx(workpiece_mask, cv2.MORPH_CLOSE, morph_se)
 
-        #   Pass B ─ large close: merges fragments of the same workpiece
-        #   (kernel = 3× the honeycomb spacing to bridge gaps across the piece)
+        #   Pass B — large close: merges fragments into a single workpiece blob
         large_k = self._odd(morph_k * 3)
         large_se = cv2.getStructuringElement(cv2.MORPH_RECT, (large_k, large_k))
         closed = cv2.morphologyEx(closed, cv2.MORPH_CLOSE, large_se)
 
-        #   Erode boundary artefacts (thin fringe left by the ROI edge),
-        #   then dilate back to restore true workpiece size.
+        #   Erode boundary artefacts, then dilate back to true size
         boundary_se = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_k, morph_k))
         eroded  = cv2.erode(closed, boundary_se, iterations=1)
         dilated = cv2.dilate(eroded, boundary_se, iterations=2)
 
-        # ── 7. Find contours (proc-space) ────────────────────────────────────
-        contours, _ = cv2.findContours(
+        # ── 7. Candidate blobs from variance mask ────────────────────────────
+        var_contours, _ = cv2.findContours(
             dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        logger.debug(f"Contours before area filter: {len(contours)}")
+        logger.debug(f"Variance blobs before area filter: {len(var_contours)}")
 
-        # ── 8. Build results — scale contours to full-res ────────────────────
+        # ── 8. Edge-refinement stage ─────────────────────────────────────────
+        #   For each variance blob:
+        #     a) Extract a padded bounding-box region from the CLAHE image
+        #     b) Apply a large Gaussian blur (> cell diameter) — this kills the
+        #        fine honeycomb cell edges while preserving the much larger
+        #        workpiece boundary
+        #     c) Run Canny — the dominant edges left are the workpiece outline
+        #     d) Find the largest closed contour inside the padded region
+        #     e) If a good edge contour is found, use it; otherwise fall back
+        #        to the variance blob (handles dark materials with low contrast)
+        #
+        # edge_blur_k must exceed the honeycomb cell diameter at proc resolution.
+        # We derive it from var_k (which already spans 2+ cells).
+        edge_blur_k = self._odd(var_k * 2)
+        edge_blurred = cv2.GaussianBlur(enhanced, (edge_blur_k, edge_blur_k), 0)
+
+        # Canny thresholds: low = 20% of high to catch weak workpiece boundaries
+        canny_high = int(os.getenv("DETECT_CANNY_HIGH", "60"))
+        canny_low  = int(canny_high * 0.2)
+        canny_edges = cv2.Canny(edge_blurred, canny_low, canny_high)
+
+        # Restrict Canny output to inside the ROI only
+        canny_edges = cv2.bitwise_and(canny_edges, canny_edges, mask=mask_roi)
+
+        # Keep the full Canny map for the debug panel (Panel D)
+        debug_canny = canny_edges.copy()
+
         results = []
         from .calibration import calibration_service as cal
 
-        for i, cnt in enumerate(contours):
-            area_proc = cv2.contourArea(cnt)
+        for i, var_cnt in enumerate(var_contours):
+            area_proc = cv2.contourArea(var_cnt)
             if area_proc < min_area or area_proc > (proc_w * proc_h * 0.5):
                 continue
 
-            # Scale contour from proc-space → full-res
-            if ds < 1.0:
-                cnt_full = (cnt.astype(np.float64) / ds).astype(np.int32)
-            else:
-                cnt_full = cnt
+            # Pad the bounding box so edge detection can see the workpiece boundary
+            pad = large_k
+            bx, by, bw, bh = cv2.boundingRect(var_cnt)
+            x1 = max(0, bx - pad);  y1 = max(0, by - pad)
+            x2 = min(proc_w, bx + bw + pad);  y2 = min(proc_h, by + bh + pad)
 
-            # Oriented bounding rect → 4 corners + angle
+            # Extract Canny edges within the padded region
+            region_edges = canny_edges[y1:y2, x1:x2].copy()
+
+            # Dilate edges slightly to close gaps in the workpiece outline
+            gap_se = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            region_edges = cv2.dilate(region_edges, gap_se, iterations=1)
+
+            edge_cnts, _ = cv2.findContours(
+                region_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            # Pick the largest edge contour that is at least 30% of the variance blob
+            best_edge_cnt = None
+            if edge_cnts:
+                edge_cnts_sorted = sorted(edge_cnts, key=cv2.contourArea, reverse=True)
+                for ec in edge_cnts_sorted:
+                    if cv2.contourArea(ec) >= area_proc * 0.3:
+                        best_edge_cnt = ec
+                        break
+
+            if best_edge_cnt is not None:
+                # Translate edge contour back to proc-space coordinates
+                refined_cnt = best_edge_cnt + np.array([[[x1, y1]]], dtype=np.int32)
+                logger.debug(
+                    f"Blob {i}: edge contour found "
+                    f"({cv2.contourArea(best_edge_cnt):.0f} px² in region)"
+                )
+            else:
+                # Fall back to the variance blob — typically dark materials
+                # where brightness contrast against the bed is low
+                refined_cnt = var_cnt
+                logger.debug(f"Blob {i}: no edge contour — using variance blob fallback")
+
+            # ── Scale to full-res and map to mm ─────────────────────────────
+            if ds < 1.0:
+                cnt_full = (refined_cnt.astype(np.float64) / ds).astype(np.int32)
+            else:
+                cnt_full = refined_cnt
+
             rect = cv2.minAreaRect(cnt_full)
             corners_px = cv2.boxPoints(rect).astype(np.int32)
-            angle_deg = float(rect[2])
+            angle_deg  = float(rect[2])
 
-            # Convex hull as segmentation polygon
             hull = cv2.convexHull(cnt_full)
             seg_px = hull.reshape(-1, 2).tolist()
 
-            # Axis-aligned bounding box (full-res pixels)
             x, y, w, h = cv2.boundingRect(cnt_full)
 
-            # Map to physical mm via calibration homography
             corners_mm = cal.map_pixels_to_mm(corners_px.astype(np.float32))
-            seg_mm = cal.map_pixels_to_mm(
-                np.array(seg_px, dtype=np.float32)
-            )
+            seg_mm     = cal.map_pixels_to_mm(np.array(seg_px, dtype=np.float32))
 
-            # Physical area filter
             area_mm2 = float(
                 cv2.contourArea(corners_mm.reshape(-1, 1, 2).astype(np.float32))
             )
@@ -279,7 +335,7 @@ class InferenceService:
         logger.info(
             f"Detection complete: {len(results)} workpiece(s) in {elapsed:.2f}s"
         )
-        return results, raw_var_mask, proc_w, proc_h
+        return results, raw_var_mask, debug_canny, proc_w, proc_h
 
     # ── Debug Image ────────────────────────────────────────────────────────────
 
@@ -287,13 +343,15 @@ class InferenceService:
         self, image: np.ndarray, results: List[Dict],
         mean_brightness: float,
         var_mask_proc: np.ndarray | None = None,
+        canny_proc: np.ndarray | None = None,
         proc_w: int = 0, proc_h: int = 0,
     ) -> None:
         """
-        Save a 3-panel diagnostic composite:
-          Panel A (left)   — raw frame with detection overlays
-          Panel B (centre) — CLAHE-enhanced grayscale (detector input)
-          Panel C (right)  — raw variance threshold mask (before morphology)
+        Save a 4-panel diagnostic composite:
+          Panel A (left)    — raw frame with detection overlays
+          Panel B           — CLAHE-enhanced grayscale (detector input)
+          Panel C           — variance threshold mask (pre-morphology, cyan=workpiece)
+          Panel D (right)   — Canny edge map after large-kernel blur (yellow edges)
         """
         debug_path = "calibration_data/detect_debug.jpg"
         os.makedirs(os.path.dirname(debug_path), exist_ok=True)
@@ -328,28 +386,40 @@ class InferenceService:
             clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
             panel_b = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
 
-            # Panel C: variance mask upscaled to match panel size
+            # Panel C: variance mask
             if var_mask_proc is not None and var_mask_proc.size > 0:
                 panel_c = cv2.cvtColor(
                     cv2.resize(var_mask_proc, (tw, th), interpolation=cv2.INTER_NEAREST),
                     cv2.COLOR_GRAY2BGR
                 )
-                # Tint low-variance (white) pixels cyan so workpiece pops
                 cyan_tint = np.zeros_like(panel_c)
-                cyan_tint[panel_c[:, :, 0] > 128] = [255, 255, 0]  # cyan = B+G
+                cyan_tint[panel_c[:, :, 0] > 128] = [255, 255, 0]
                 panel_c = cv2.addWeighted(panel_c, 0.4, cyan_tint, 0.6, 0)
             else:
                 panel_c = np.zeros((th, tw, 3), dtype=np.uint8)
 
+            # Panel D: Canny edges (yellow on black)
+            if canny_proc is not None and canny_proc.size > 0:
+                panel_d = cv2.cvtColor(
+                    cv2.resize(canny_proc, (tw, th), interpolation=cv2.INTER_NEAREST),
+                    cv2.COLOR_GRAY2BGR
+                )
+                yellow_tint = np.zeros_like(panel_d)
+                yellow_tint[panel_d[:, :, 0] > 128] = [0, 255, 255]  # yellow = G+R
+                panel_d = cv2.addWeighted(panel_d, 0.0, yellow_tint, 1.0, 0)
+            else:
+                panel_d = np.zeros((th, tw, 3), dtype=np.uint8)
+
             lbl = dict(
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.7,
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.6,
                 color=(0, 255, 255), thickness=2,
             )
             cv2.putText(panel_a, f"RAW  mean={mean_brightness:.0f}", (10, 30), **lbl)
-            cv2.putText(panel_b, "CLAHE gray (detector input)", (10, 30), **lbl)
-            cv2.putText(panel_c, "Variance mask (pre-morphology)", (10, 30), **lbl)
+            cv2.putText(panel_b, "CLAHE (detector input)", (10, 30), **lbl)
+            cv2.putText(panel_c, "Variance mask (cyan=workpiece)", (10, 30), **lbl)
+            cv2.putText(panel_d, "Canny edges (yellow=boundary)", (10, 30), **lbl)
 
-            cv2.imwrite(debug_path, np.hstack([panel_a, panel_b, panel_c]))
+            cv2.imwrite(debug_path, np.hstack([panel_a, panel_b, panel_c, panel_d]))
         except Exception as e:
             logger.warning(f"Debug composite failed: {e}")
             cv2.imwrite(debug_path, debug_img)
@@ -379,8 +449,8 @@ class InferenceService:
                 "AE may still be settling — results may be unreliable."
             )
 
-        results, raw_var_mask, proc_w, proc_h = self._detect_objects(image)
-        self._save_debug_image(image, results, mean_brightness, raw_var_mask, proc_w, proc_h)
+        results, raw_var_mask, debug_canny, proc_w, proc_h = self._detect_objects(image)
+        self._save_debug_image(image, results, mean_brightness, raw_var_mask, debug_canny, proc_w, proc_h)
         return results
 
 
