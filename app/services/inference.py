@@ -35,7 +35,7 @@ class InferenceService:
         self.max_area_mm2 = float(os.getenv("MAX_WORKPIECE_AREA_MM2", "160000"))
         self.honeycomb_kernel = int(os.getenv("HONEYCOMB_KERNEL_SIZE", "25"))
         self.apriltag_mask_padding = int(os.getenv("APRILTAG_MASK_PADDING", "30"))
-        self.variance_window = int(os.getenv("DETECT_VARIANCE_WINDOW", "25"))
+        self.variance_window = int(os.getenv("DETECT_VARIANCE_WINDOW", "55"))
         # Variance threshold controls — tune via debug image Panel C
         self.variance_percentile = float(os.getenv("DETECT_VARIANCE_PERCENTILE", "70"))
         self.variance_multiplier = float(os.getenv("DETECT_VARIANCE_MULTIPLIER", "0.25"))
@@ -95,6 +95,11 @@ class InferenceService:
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
 
+        # Gaussian blur is used for morphological pre-processing (smooth_k) but
+        # we compute local variance on the RAW enhanced image so that honeycomb
+        # cell-wall transitions are preserved. Blurring before variance washes
+        # out those transitions and makes cell interiors indistinguishable from
+        # solid workpiece surfaces.
         smoothed = cv2.GaussianBlur(enhanced, (smooth_k, smooth_k), 0)
 
         # ── 3. Build ROI mask from AprilTag convex hull ──────────────────────
@@ -144,12 +149,16 @@ class InferenceService:
             )
             mask_roi = cv2.erode(mask_roi, erode_se, iterations=1)
 
-        # ── 4. Local variance — texture-based detection ──────────────────────
+        # ── 4. Local variance on the UNSMOOTHED CLAHE image ─────────────────
         #    Variance = E[X²] − E[X]²   (two box filters, very fast)
         #
-        #    Honeycomb → high variance (repeating hole pattern)
-        #    Solid workpiece → low variance (continuous surface)
-        sf = smoothed.astype(np.float32)
+        #    var_k must span 2+ honeycomb cells so the window sees wall
+        #    transitions and marks cell regions as HIGH variance.
+        #    Honeycomb → high variance (cell walls create sharp transitions)
+        #    Solid workpiece → low variance (continuous uniform surface)
+        #
+        #    Using `enhanced` (not `smoothed`) preserves the cell-wall signal.
+        sf = enhanced.astype(np.float32)
         mean_img = cv2.blur(sf, (var_k, var_k))
         mean_sq  = cv2.blur(sf * sf, (var_k, var_k))
         local_var = np.maximum(mean_sq - mean_img * mean_img, 0.0)
