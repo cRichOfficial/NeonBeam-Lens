@@ -261,7 +261,7 @@ class InferenceService:
         #  if the threshold missed a dark-grained ring around the edges.
         #  DETECT_EDGE_PAD_PX (default = morph_k) expands the hull outward to
         #  cover those missed edge pixels before the final close.
-        edge_pad = int(os.getenv("DETECT_EDGE_PAD_PX", str(morph_k)))
+        edge_pad = int(os.getenv("DETECT_EDGE_PAD_PX", str(morph_k // 2)))
         if edge_pad > 0:
             pad_se   = cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE, (self._odd(edge_pad), self._odd(edge_pad))
@@ -392,18 +392,24 @@ class InferenceService:
 
             cv2.polylines(overlay, [pts], True, (0, 220, 0), 2)
             cv2.arrowedLine(overlay, (cx, cy), (ax, ay), (0, 140, 255), 2, tipLength=0.25)
-            cv2.putText(
-                overlay,
-                f"{wp['id']}  {wp.get('angle_deg', 0):.1f}\u00b0  {wp.get('area_mm2', 0):.0f}mm\u00b2",
-                (pts[0][0], pts[0][1] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 0), 2,
-            )
+
+            def _text(img, txt, pos, scale, fg, thickness):
+                """Draw outlined text: thick black stroke then bright colour on top."""
+                cv2.putText(img, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                            scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+                cv2.putText(img, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                            scale, fg,       thickness,     cv2.LINE_AA)
+
+            _text(overlay,
+                  f"{wp['id']}  {wp.get('angle_deg', 0):.1f}\u00b0  {wp.get('area_mm2', 0):.0f}mm\u00b2",
+                  (pts[0][0], pts[0][1] - 12),
+                  0.55, (0, 255, 60), 2)
+
             for px, mm in zip(pts, wp['corners_mm']):
-                cv2.putText(
-                    overlay, f"({int(mm[0])},{int(mm[1])})",
-                    (int(px[0]), int(px[1])),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 230, 0), 1,
-                )
+                _text(overlay,
+                      f"({int(mm[0])},{int(mm[1])})",
+                      (int(px[0]), int(px[1])),
+                      0.6, (255, 255, 255), 2)
 
         try:
             MAX_W = 1280
