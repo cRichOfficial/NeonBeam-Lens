@@ -117,6 +117,7 @@ async def generate_checkerboard(
 
 # Module-level session holder (one active session at a time)
 _lens_session: LensCalibrationSession | None = None
+_lens_capture_lock = asyncio.Lock()
 
 @app.post("/api/lens/calibrate-lens/start")
 async def lens_calibration_start(
@@ -129,13 +130,21 @@ async def lens_calibration_start(
 
 @app.post("/api/lens/calibrate-lens/capture")
 async def lens_calibration_capture():
-    """Capture a frame and attempt to detect the checkerboard."""
+    """Capture a frame and attempt to detect the checkerboard.
+
+    The CV computation (findChessboardCorners) is offloaded to a thread pool
+    so the FastAPI event loop is not blocked during the ~0.5-2s detection.
+    A lock prevents overlapping captures if the client calls rapidly.
+    """
     if _lens_session is None or not _lens_session.active:
         raise HTTPException(status_code=400, detail="No active lens calibration session. Call /start first.")
-    frame = camera_service.get_frame()
-    if frame is None:
-        raise HTTPException(status_code=503, detail="Camera frame not available.")
-    return _lens_session.capture(frame)
+    if _lens_capture_lock.locked():
+        raise HTTPException(status_code=429, detail="A capture is already in progress. Please wait.")
+    async with _lens_capture_lock:
+        frame = camera_service.get_frame()
+        if frame is None:
+            raise HTTPException(status_code=503, detail="Camera frame not available.")
+        return await asyncio.to_thread(_lens_session.capture, frame)
 
 @app.post("/api/lens/calibrate-lens/finish")
 async def lens_calibration_finish():
@@ -143,9 +152,33 @@ async def lens_calibration_finish():
     global _lens_session
     if _lens_session is None or not _lens_session.active:
         raise HTTPException(status_code=400, detail="No active lens calibration session.")
-    result = _lens_session.finish(calibration_service)
+    result = await asyncio.to_thread(_lens_session.finish, calibration_service)
     _lens_session = None
     return result
+
+@app.delete("/api/lens/calibrate-lens")
+async def lens_calibration_reset():
+    """Delete the saved lens calibration, forcing a full recalibration.
+
+    Also cancels any active session. After this call, lens_calibrated will
+    be False on the next health check.
+    """
+    global _lens_session
+    _lens_session = None  # kill any active session
+
+    lens_path = calibration_service.lens_data_path
+    if os.path.exists(lens_path):
+        os.remove(lens_path)
+
+    # Clear in-memory state
+    calibration_service.camera_matrix = None
+    calibration_service.dist_coeffs = None
+    calibration_service.lens_calibrated = False
+    calibration_service._undistort_map1 = None
+    calibration_service._undistort_map2 = None
+    calibration_service._undistort_resolution = None
+
+    return {"status": "reset", "message": "Lens calibration cleared. Run /start to recalibrate."}
 
 @app.get("/api/lens/calibrate-lens/status")
 async def lens_calibration_status():

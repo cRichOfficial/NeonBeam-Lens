@@ -572,8 +572,18 @@ class LensCalibrationSession:
         self.active = True
         return self._status(instruction=self._next_instruction())
 
+    # Maximum long-side dimension for checkerboard detection.
+    # findChessboardCorners is O(n²) — running it at 12MP will OOM/lock the Pi.
+    _DETECT_MAX_DIM = 1280
+
     def capture(self, frame: np.ndarray) -> Dict:
-        """Attempt to detect the checkerboard in `frame`."""
+        """Attempt to detect the checkerboard in `frame`.
+
+        The frame is downscaled to _DETECT_MAX_DIM on its long side before
+        running findChessboardCorners (which is very slow at 12MP), then the
+        detected corners are scaled back to the original resolution so that
+        calibrateCamera receives full-resolution image coordinates.
+        """
         if not self.active:
             return {"error": "No active session. Call /start first."}
 
@@ -583,40 +593,62 @@ class LensCalibrationSession:
                 message="Maximum captures reached. Call /finish to compute calibration.",
             )
 
-        h, w = frame.shape[:2]
-        self.image_size = (w, h)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h_full, w_full = frame.shape[:2]
+
+        # ── Downscale for corner detection ──
+        scale = min(1.0, self._DETECT_MAX_DIM / max(w_full, h_full))
+        if scale < 1.0:
+            w_small = int(w_full * scale)
+            h_small = int(h_full * scale)
+            small = cv2.resize(frame, (w_small, h_small), interpolation=cv2.INTER_AREA)
+        else:
+            small = frame
+            w_small, h_small = w_full, h_full
+
+        gray_small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
         flags = (
             cv2.CALIB_CB_ADAPTIVE_THRESH
             | cv2.CALIB_CB_NORMALIZE_IMAGE
             | cv2.CALIB_CB_FAST_CHECK
         )
-        found, corners = cv2.findChessboardCorners(gray, (self.rows, self.cols), flags)
+        found, corners_small = cv2.findChessboardCorners(
+            gray_small, (self.rows, self.cols), flags
+        )
 
         if not found:
-            self._save_preview(frame, None)
+            self._save_preview(small, None)
             return self._status(
                 success=False,
                 message="Checkerboard not detected. Ensure the full board is visible "
                         "and evenly lit. Avoid glare and shadows.",
             )
 
-        # Sub-pixel refinement
+        # Sub-pixel refinement on the small image
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-        corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+        corners_small = cv2.cornerSubPix(
+            gray_small, corners_small, (11, 11), (-1, -1), criteria
+        )
 
-        # Determine which zone the board center falls in
-        center = corners.mean(axis=0).flatten()
-        zone = self._classify_zone(center, w, h)
+        # Scale corners back to full-resolution coordinates for calibrateCamera
+        if scale < 1.0:
+            corners_full = corners_small / scale
+        else:
+            corners_full = corners_small
 
-        # Store
+        # Store full-res size and full-res corner coordinates
+        self.image_size = (w_full, h_full)
+
+        # Determine zone from small-image corner positions
+        center = corners_small.mean(axis=0).flatten()
+        zone = self._classify_zone(center, w_small, h_small)
+
         self.obj_points_list.append(self._obj_pts.copy())
-        self.img_points_list.append(corners)
+        self.img_points_list.append(corners_full)
         self.capture_count += 1
         self.zones_hit[zone] = self.zones_hit.get(zone, 0) + 1
 
-        self._save_preview(frame, corners)
+        self._save_preview(small, corners_small)
 
         return self._status(
             success=True,
@@ -682,6 +714,17 @@ class LensCalibrationSession:
             model=model,
         )
 
+        # Invalidate any existing homography — it was computed on distorted pixels
+        # and is no longer valid now that lens undistortion is active.
+        if os.path.exists(cal_service.data_path):
+            os.remove(cal_service.data_path)
+            logger.info(
+                "Deleted homography (matrix.json) — must be recomputed "
+                "on undistorted frames."
+            )
+        cal_service.homography_matrix = None
+        cal_service.calibration_data = None
+
         self.active = False
 
         return {
@@ -693,9 +736,9 @@ class LensCalibrationSession:
             "captures_used": self.capture_count,
             "zones_covered": list(self.zones_hit.keys()),
             "note": (
-                "Lens calibration saved. You should now re-run the AprilTag "
-                "homography calibration (POST /api/lens/calibrate) since "
-                "undistortion changes pixel positions."
+                "Lens calibration saved and previous homography invalidated. "
+                "Re-run the Mapping calibration (POST /api/lens/calibrate) "
+                "so coordinates are computed on undistorted frames."
             ),
         }
 
