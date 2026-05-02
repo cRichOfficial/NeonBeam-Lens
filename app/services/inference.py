@@ -219,14 +219,16 @@ class InferenceService:
         #     e) If a good edge contour is found, use it; otherwise fall back
         #        to the variance blob (handles dark materials with low contrast)
         #
-        # edge_blur_k must exceed the honeycomb cell diameter at proc resolution.
-        # We derive it from var_k (which already spans 2+ cells).
-        edge_blur_k = self._odd(var_k * 2)
+        # edge_blur_k only needs to exceed one honeycomb cell diameter to suppress
+        # individual cell-wall edges. Using var_k (which spans 2+ cells) was far
+        # too large and washed out the workpiece boundary entirely.
+        # morph_k already represents one cell span at the working resolution.
+        edge_blur_k = self._odd(morph_k * 2)
         edge_blurred = cv2.GaussianBlur(enhanced, (edge_blur_k, edge_blur_k), 0)
 
         # Canny thresholds: low = 20% of high to catch weak workpiece boundaries
-        canny_high = int(os.getenv("DETECT_CANNY_HIGH", "60"))
-        canny_low  = int(canny_high * 0.2)
+        canny_high = float(os.getenv("DETECT_CANNY_HIGH", "60"))
+        canny_low  = canny_high * 0.2
         canny_edges = cv2.Canny(edge_blurred, canny_low, canny_high)
 
         # Restrict Canny output to inside the ROI only
@@ -419,7 +421,10 @@ class InferenceService:
             cv2.putText(panel_c, "Variance mask (cyan=workpiece)", (10, 30), **lbl)
             cv2.putText(panel_d, "Canny edges (yellow=boundary)", (10, 30), **lbl)
 
-            cv2.imwrite(debug_path, np.hstack([panel_a, panel_b, panel_c, panel_d]))
+            # 2×2 grid: easier to view than a 4-wide strip
+            top_row    = np.hstack([panel_a, panel_b])
+            bottom_row = np.hstack([panel_c, panel_d])
+            cv2.imwrite(debug_path, np.vstack([top_row, bottom_row]))
         except Exception as e:
             logger.warning(f"Debug composite failed: {e}")
             cv2.imwrite(debug_path, debug_img)
