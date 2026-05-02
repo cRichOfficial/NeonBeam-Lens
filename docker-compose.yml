@@ -2,19 +2,16 @@
 # ║  NeonBeam Lens — Standalone Docker Compose                                 ║
 # ║                                                                              ║
 # ║  Runs the machine vision FastAPI service on port 8001.                      ║
-# ║                                                                              ║
-# ║  Hardware targets:                                                           ║
-# ║    Development:  Any machine with a USB webcam (CPU OpenCV, no NPU)         ║
-# ║    Production:   Raspberry Pi 5 + Hailo-8L M.2 NPU Accelerator              ║
+# ║  Detection is performed entirely in software (OpenCV).                      ║
+# ║  No NPU hardware is required.                                               ║
 # ║                                                                              ║
 # ║  Usage                                                                       ║
 # ║  ─────────────────────────────────────────────────────────────────────────  ║
-# ║    # Development (software fallback, USB webcam):                            ║
+# ║    # Build and run (foreground):                                             ║
 # ║    docker compose up --build                                                 ║
 # ║                                                                              ║
-# ║    # Production (Pi 5 + Hailo-8L, detached):                                ║
+# ║    # Run detached (production):                                              ║
 # ║    docker compose up -d --build                                              ║
-# ║    # then uncomment the 'devices' block and set VISION_CAMERA_ID below.     ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 services:
@@ -28,8 +25,7 @@ services:
     # ── Network & Port Exposure ──────────────────────────────────────────────
     # For mDNS discovery to work on the Raspberry Pi (Linux), network_mode: host
     # is required so multicast traffic reaches the LAN.
-    # Note: When using host mode, 'ports' mapping is ignored as the container
-    # uses the host's IP and the service port (8001).
+    # Note: When using host mode, 'ports' mapping is ignored.
     #
     # network_mode: host  # Recommended for Raspberry Pi / Production
 
@@ -40,7 +36,6 @@ services:
     # Persist calibration data so it survives container restarts.
     volumes:
       - ./calibration_data:/app/calibration_data
-      - ./models:/app/models
 
     # ── Environment Configuration ────────────────────────────────────────────
     env_file:
@@ -48,13 +43,8 @@ services:
     environment:
       - VISION_CAMERA_ID=0
       - VISION_DEBUG_LOGGING=True
-      - USE_HAILO=False  # Set to True on Pi 5 with AI Kit
 
     # ── Hardware Pass-through ────────────────────────────────────────────────
-    # Uncomment the following on the Pi 5 to grant access to the Camera and NPU.
-    devices:
-      - /dev/video0:/dev/video0   # Camera
-      - /dev/hailo0:/dev/hailo0   # Hailo-8L NPU
-    
-    # If using libcamera on Pi, you might need privileged mode for media nodes:
-    # privileged: true
+    # Uncomment to grant container access to the camera device.
+    # devices:
+    #   - /dev/video0:/dev/video0   # Camera
