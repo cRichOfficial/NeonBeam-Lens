@@ -16,6 +16,8 @@ sudo apt-get install -y \
     python3-pip \
     python3-venv \
     python3-dev \
+    python3-picamera2 \
+    python3-libcamera \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
@@ -25,13 +27,15 @@ sudo apt-get install -y \
     v4l-utils
 
 # 2. Create virtual environment
-echo "[2/4] Creating virtual environment (.venv)..."
+echo "[2/4] Creating virtual environment (.venv) with system package access..."
+# We use --system-site-packages so the venv can access picamera2 and libcamera
+# bindings which are typically managed by the system package manager on the Pi.
 
 if [ -d ".venv" ]; then
     rm -rf .venv
 fi
 
-python3 -m venv .venv
+python3 -m venv .venv --system-site-packages
 echo "Created .venv."
 
 # 3. Install Python dependencies
