@@ -387,23 +387,33 @@ class InferenceService:
 
             panel_a = cv2.resize(overlay, (tw, th))
 
-            gray_b  = cv2.cvtColor(cv2.resize(image, (tw, th)), cv2.COLOR_BGR2GRAY)
-            panel_b = cv2.cvtColor(
-                cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray_b),
-                cv2.COLOR_GRAY2BGR,
-            )
+            # CLAHE base — reused as the background for panels B, C, D, E
+            gray_b   = cv2.cvtColor(cv2.resize(image, (tw, th)), cv2.COLOR_BGR2GRAY)
+            clahe_b  = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray_b)
+            base_bgr = cv2.cvtColor(clahe_b, cv2.COLOR_GRAY2BGR)
+            panel_b  = base_bgr.copy()
 
-            def _tint(mask: np.ndarray | None, color_bgr: tuple) -> np.ndarray:
+            def _overlay(mask: np.ndarray | None, color_bgr: tuple,
+                         alpha: float = 0.55) -> np.ndarray:
+                """
+                Blend a coloured mask on top of the CLAHE base image.
+                Masked pixels = (1-alpha)*base + alpha*colour.
+                Unmasked pixels = base (the scene is fully visible).
+                """
+                out = base_bgr.copy()
                 if mask is None or mask.size == 0:
-                    return np.zeros((th, tw, 3), dtype=np.uint8)
+                    return out
                 m = cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST)
-                out = np.zeros((th, tw, 3), dtype=np.uint8)
-                out[m > 128] = color_bgr
+                color_layer = np.full((th, tw, 3), color_bgr, dtype=np.uint8)
+                where = m > 128
+                out[where] = cv2.addWeighted(
+                    base_bgr, 1 - alpha, color_layer, alpha, 0
+                )[where]
                 return out
 
-            panel_c = _tint(raw_mask,       (255,  60, 180))   # magenta — raw threshold
-            panel_d = _tint(candidate_mask,  (0,   220, 220))   # yellow  — candidates
-            panel_e = _tint(canny_diag,      (0,   255, 120))   # green   — canny diag
+            panel_c = _overlay(raw_mask,      (255,  50, 180))   # magenta — raw threshold
+            panel_d = _overlay(candidate_mask, (0,   230, 230))   # yellow  — candidates
+            panel_e = _overlay(canny_diag,     (0,   255, 100))   # green   — canny diag
 
             lbl = dict(fontFace=cv2.FONT_HERSHEY_SIMPLEX,
                        fontScale=0.5, color=(0, 255, 255), thickness=2)
