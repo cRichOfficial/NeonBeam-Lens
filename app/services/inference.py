@@ -36,6 +36,9 @@ class InferenceService:
         self.honeycomb_kernel = int(os.getenv("HONEYCOMB_KERNEL_SIZE", "25"))
         self.apriltag_mask_padding = int(os.getenv("APRILTAG_MASK_PADDING", "30"))
         self.variance_window = int(os.getenv("DETECT_VARIANCE_WINDOW", "25"))
+        # Variance threshold controls — tune via debug image Panel C
+        self.variance_percentile = float(os.getenv("DETECT_VARIANCE_PERCENTILE", "70"))
+        self.variance_multiplier = float(os.getenv("DETECT_VARIANCE_MULTIPLIER", "0.25"))
         self.initialized = True
         logger.info("InferenceService initialised (OpenCV texture-variance detector).")
 
@@ -157,11 +160,10 @@ class InferenceService:
             logger.warning("ROI is empty — cannot detect objects.")
             return []
 
-        # Use p70 of ROI variance as the honeycomb baseline — it captures more
-        # of the distribution and is less sensitive to partially-occluded cells.
+        # Use configurable percentile + multiplier — tune via debug Panel C.
         # A solid workpiece is typically <25% of the honeycomb variance.
-        hc_baseline = float(np.percentile(roi_var, 70))   # was p60
-        var_thresh   = hc_baseline * 0.25                  # was 0.40
+        hc_baseline = float(np.percentile(roi_var, self.variance_percentile))
+        var_thresh   = hc_baseline * self.variance_multiplier
 
         logger.debug(
             f"Variance: HC baseline (p60)={hc_baseline:.1f}, "
