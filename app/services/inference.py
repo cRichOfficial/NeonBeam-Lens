@@ -226,34 +226,44 @@ class InferenceService:
         # Restrict to ROI
         raw_mask = cv2.bitwise_and(raw_mask, raw_mask, mask=mask_roi)
 
-        # ── 5. Combined convex hull of all valid fragments ────────────────────
+        # ── 5. Grouped convex hull (Object-aware) ─────────────────────────────
         #
-        #  Wood grain / uneven lighting splits the threshold mask into several
-        #  disconnected blobs.  If we hull each blob individually the result
-        #  is several small hulls that don't cover the whole piece.
+        #  Wood grain / uneven lighting splits a single workpiece into several
+        #  disconnected blobs.  To fix this, we "group" blobs that are close
+        #  to each other by dilating the mask, finding connected groups,
+        #  and then taking the convex hull of only the fragments within each group.
         #
-        #  Solution: combine all valid fragment points into ONE point cloud and
-        #  take a single convex hull.  Even if grain cuts the piece into three
-        #  fragments the combined hull spans from the top-left fragment to the
-        #  bottom-right fragment — giving the correct overall extent.
-        #
-        #  Fragments below min_area * 0.1 are still accepted as contributors
-        #  (they help define the outer boundary) but below min_area * 0.05 are
-        #  pure noise and ignored.
+        #  This bridges the grain gaps within a single piece without merging
+        #  separate workpieces that are far apart.
 
-        init_cnts, _ = cv2.findContours(
-            raw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        # 5a. Create grouping mask by dilating (bridges gaps up to morph_k px)
+        group_se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_k, morph_k))
+        group_mask = cv2.dilate(raw_mask, group_se)
+
+        # 5b. Find groups (potential separate objects)
+        group_cnts, _ = cv2.findContours(
+            group_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        fragment_pts = []
-        for cnt in init_cnts:
-            if cv2.contourArea(cnt) >= max(min_area * 0.05, 30):
-                fragment_pts.append(cnt.reshape(-1, 2))
 
         hull_mask = np.zeros((proc_h, proc_w), dtype=np.uint8)
-        if fragment_pts:
-            combined_pts  = np.vstack(fragment_pts)
-            combined_hull = cv2.convexHull(combined_pts)
-            cv2.fillPoly(hull_mask, [combined_hull], 255)
+        for g_cnt in group_cnts:
+            # Cheap area filter to ignore tiny noise groups
+            if cv2.contourArea(g_cnt) < max(min_area * 0.05, 50):
+                continue
+
+            # Create a mask for this specific group to isolate its fragments
+            temp_g_mask = np.zeros((proc_h, proc_w), dtype=np.uint8)
+            cv2.drawContours(temp_g_mask, [g_cnt], -1, 255, -1)
+
+            # Find all original threshold points that fall inside this group
+            object_pts_mask = cv2.bitwise_and(raw_mask, temp_g_mask)
+            pts = np.argwhere(object_pts_mask > 0)
+
+            if len(pts) > 5:
+                # np.argwhere returns [y, x], cv2 expects [x, y]
+                pts_xy = pts[:, [1, 0]].astype(np.int32)
+                hull = cv2.convexHull(pts_xy)
+                cv2.fillPoly(hull_mask, [hull], 255)
 
         # ── 6. Edge-pad dilation + morphological close ────────────────────────
         #
