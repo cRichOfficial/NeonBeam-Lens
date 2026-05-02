@@ -261,7 +261,7 @@ class InferenceService:
         #  if the threshold missed a dark-grained ring around the edges.
         #  DETECT_EDGE_PAD_PX (default = morph_k) expands the hull outward to
         #  cover those missed edge pixels before the final close.
-        edge_pad = int(os.getenv("DETECT_EDGE_PAD_PX", str(morph_k // 2)))
+        edge_pad = int(os.getenv("DETECT_EDGE_PAD_PX", "0"))
         if edge_pad > 0:
             pad_se   = cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE, (self._odd(edge_pad), self._odd(edge_pad))
