@@ -86,11 +86,13 @@ class InferenceService:
             logger.warning("Reference frame unreadable.")
             return None
         resized = cv2.resize(raw, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
-        gray    = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-        clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        self._ref_gray_proc = clahe.apply(gray)
+        # Store RAW grayscale — no CLAHE here.
+        # CLAHE is content-adaptive: it normalises differently when a workpiece
+        # covers the bed, making dark grain look 'unchanged' vs the empty reference.
+        # Raw pixel values reliably reflect the physical brightness change.
+        self._ref_gray_proc = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
         self._ref_proc_size = (proc_w, proc_h)
-        logger.debug(f"Reference loaded at {proc_w}x{proc_h}.")
+        logger.debug(f"Reference loaded at {proc_w}x{proc_h} (raw gray, no CLAHE).")
         return self._ref_gray_proc
 
     # ── Helpers ────────────────────────────────────────────────────────────────
@@ -193,15 +195,18 @@ class InferenceService:
         ref_gray = self._load_ref_gray(proc_w, proc_h)
 
         if ref_gray is not None:
-            # Diff on the blurred CLAHE image (blurring reduces isolated noise)
-            ref_blurred = cv2.GaussianBlur(ref_gray, (smooth_k, smooth_k), 0)
-            abs_diff    = cv2.absdiff(blurred, ref_blurred)
-            _, raw_mask = cv2.threshold(
+            # Diff on RAW blurred grayscale — NOT the CLAHE-enhanced image.
+            # ref_gray is raw (no CLAHE); we blur both sides equally to suppress
+            # per-pixel camera noise before thresholding the change magnitude.
+            gray_blurred = cv2.GaussianBlur(gray, (smooth_k, smooth_k), 0)
+            ref_blurred  = cv2.GaussianBlur(ref_gray, (smooth_k, smooth_k), 0)
+            abs_diff     = cv2.absdiff(gray_blurred, ref_blurred)
+            _, raw_mask  = cv2.threshold(
                 abs_diff, self.diff_threshold, 255, cv2.THRESH_BINARY
             )
             strategy = "diff"
             logger.debug(
-                f"Diff mask: threshold={self.diff_threshold}  "
+                f"Diff mask (raw gray): threshold={self.diff_threshold}  "
                 f"px={cv2.countNonZero(raw_mask)}"
             )
         else:
