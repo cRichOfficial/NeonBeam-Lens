@@ -83,12 +83,13 @@ class TransformRequest(BaseModel):
 @app.get("/api/health")
 async def health_check():
     return {
-        "status": "ok", 
+        "status": "ok",
         "service": "machine_vision",
         "detector": "opencv",
         "camera_active": camera_service.running,
         "lens_calibrated": calibration_service.lens_calibrated,
         "homography_calibrated": calibration_service.homography_matrix is not None,
+        "reference_frame_captured": inference_service.has_reference,
     }
 
 @app.get("/api/apriltag/generate/{tag_id}")
@@ -154,6 +155,13 @@ async def lens_calibration_finish():
         raise HTTPException(status_code=400, detail="No active lens calibration session.")
     result = await asyncio.to_thread(_lens_session.finish, calibration_service)
     _lens_session = None
+
+    # The undistortion map has changed, so the stored reference frame is now
+    # spatially misaligned. Delete it — it will be recaptured automatically
+    # the next time the user runs the mapping calibration.
+    inference_service.clear_reference_frame()
+    logger.info("Lens recalibration complete — reference frame invalidated.")
+
     return result
 
 @app.delete("/api/lens/calibrate-lens")
@@ -223,22 +231,60 @@ async def calibrate(request: CalibrationRequest):
     frame = camera_service.get_frame()
     if frame is None:
         raise HTTPException(status_code=503, detail="Camera frame not available")
-    
+
     detected = calibration_service.detect_tags(frame)
     if not detected:
         return {"status": "error", "message": "No AprilTags detected in frame"}
-    
+
     physical_data = [t.dict() for t in request.tags]
-    # Rename fields to match calibration service expectations
     for p in physical_data:
         p['x'] = p.pop('physical_x')
         p['y'] = p.pop('physical_y')
 
     try:
         matrix = calibration_service.calibrate(detected, physical_data)
-        return {"status": "calibrated", "detected_count": len(detected)}
+
+        # Capture the empty-bed reference frame for background subtraction.
+        # At this point the bed must be clear (only AprilTags present), making
+        # it the ideal moment to save the reference without a separate workflow.
+        ref_frame = camera_service.get_frame()
+        if ref_frame is not None:
+            undistorted = calibration_service.undistort(ref_frame)
+            await asyncio.to_thread(inference_service.save_reference_frame, undistorted)
+            logger.info("Empty-bed reference frame captured during mapping calibration.")
+        else:
+            logger.warning("Could not capture reference frame — camera returned None.")
+
+        return {
+            "status": "calibrated",
+            "detected_count": len(detected),
+            "reference_frame_captured": inference_service.has_reference,
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/lens/reference-frame/status")
+async def reference_frame_status():
+    """Returns whether a background reference frame has been captured."""
+    import os, time
+    path = inference_service._REFERENCE_PATH
+    exists = os.path.exists(path)
+    captured_at = None
+    if exists:
+        captured_at = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(path))
+        )
+    return {"captured": exists, "captured_at": captured_at}
+
+
+@app.delete("/api/lens/reference-frame")
+async def delete_reference_frame():
+    """Manually invalidate the background reference frame."""
+    had = inference_service.has_reference
+    inference_service.clear_reference_frame()
+    return {"status": "deleted" if had else "not_found"}
+
 
 @app.get("/api/lens/calibration")
 async def get_calibration():

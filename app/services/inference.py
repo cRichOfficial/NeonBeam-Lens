@@ -16,19 +16,24 @@ class InferenceService:
     """
     OpenCV-based workpiece detector for a black honeycomb laser bed.
 
-    Detection strategy: **Local texture variance.**
-    The honeycomb bed has a distinctive repeating hole pattern which produces
-    high local pixel variance.  Any solid workpiece (wood, slate, acrylic,
-    card, metal) placed on it has significantly *lower* local variance because
-    it is a continuous surface.  By thresholding on low-variance regions inside
-    the AprilTag-bounded ROI, we detect objects of *any* brightness — bright
-    wood and dark slate alike.
+    Detection strategy: **Background subtraction + local texture variance (hybrid)**
 
+    Primary:  Absolute diff against a stored reference frame of the empty bed.
+              When a workpiece is placed, it changes the pixels it covers.
+              The diff cleanly isolates any placed object regardless of material.
+
+    Secondary: Local texture variance within the ROI catches objects that were
+               present when the reference was captured or in the absence of a
+               reference frame.
+
+    The two masks are OR-combined so detection is robust even without a reference.
     All expensive processing runs on a downsampled working image (capped at
     DETECT_MAX_DIM px on the long side).  Contour coordinates are scaled back
     to full resolution before the calibration homography maps them to physical
     mm values.
     """
+
+    _REFERENCE_PATH = "calibration_data/reference_frame.jpg"
 
     def __init__(self):
         self.min_area_mm2 = float(os.getenv("MIN_WORKPIECE_AREA_MM2", "500"))
@@ -36,11 +41,64 @@ class InferenceService:
         self.honeycomb_kernel = int(os.getenv("HONEYCOMB_KERNEL_SIZE", "25"))
         self.apriltag_mask_padding = int(os.getenv("APRILTAG_MASK_PADDING", "30"))
         self.variance_window = int(os.getenv("DETECT_VARIANCE_WINDOW", "55"))
-        # Variance threshold controls — tune via debug image Panel C
         self.variance_percentile = float(os.getenv("DETECT_VARIANCE_PERCENTILE", "70"))
-        self.variance_multiplier = float(os.getenv("DETECT_VARIANCE_MULTIPLIER", "0.25"))
+        self.variance_multiplier = float(os.getenv("DETECT_VARIANCE_MULTIPLIER", "0.35"))
+        # Diff threshold: pixel change (0-255) that counts as "something moved here"
+        self.diff_threshold = int(os.getenv("DETECT_DIFF_THRESHOLD", "25"))
+        # Cached reference frame (proc-res CLAHE grayscale, loaded lazily)
+        self._ref_gray_proc: np.ndarray | None = None
+        self._ref_proc_size: tuple[int, int] | None = None  # (w, h)
         self.initialized = True
-        logger.info("InferenceService initialised (OpenCV texture-variance detector).")
+        logger.info("InferenceService initialised (background-subtraction + variance hybrid).")
+
+    # ── Reference Frame ────────────────────────────────────────────────────────
+
+    @property
+    def has_reference(self) -> bool:
+        return os.path.exists(self._REFERENCE_PATH)
+
+    def save_reference_frame(self, image: np.ndarray) -> None:
+        """
+        Save `image` (already undistorted full-res frame) as the empty-bed reference.
+        The image is stored at full resolution so it can be re-processed at any
+        working resolution in future detection runs.
+        """
+        os.makedirs(os.path.dirname(self._REFERENCE_PATH), exist_ok=True)
+        cv2.imwrite(self._REFERENCE_PATH, image)
+        # Invalidate cached proc-res copy
+        self._ref_gray_proc = None
+        self._ref_proc_size = None
+        logger.info(f"Reference frame saved ({image.shape[1]}x{image.shape[0]}).")
+
+    def clear_reference_frame(self) -> None:
+        """Delete the saved reference frame (e.g. after lens recalibration)."""
+        if os.path.exists(self._REFERENCE_PATH):
+            os.remove(self._REFERENCE_PATH)
+            logger.info("Reference frame deleted.")
+        self._ref_gray_proc = None
+        self._ref_proc_size = None
+
+    def _load_ref_gray(self, proc_w: int, proc_h: int) -> np.ndarray | None:
+        """
+        Return the reference frame as a CLAHE-enhanced grayscale image at
+        (proc_w, proc_h) resolution. Result is cached until the file changes.
+        """
+        if not self.has_reference:
+            return None
+        if self._ref_gray_proc is not None and self._ref_proc_size == (proc_w, proc_h):
+            return self._ref_gray_proc
+        ref_bgr = cv2.imread(self._REFERENCE_PATH)
+        if ref_bgr is None:
+            logger.warning("Reference frame file missing or unreadable.")
+            return None
+        ref_resized = cv2.resize(ref_bgr, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
+        ref_gray = cv2.cvtColor(ref_resized, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        self._ref_gray_proc = clahe.apply(ref_gray)
+        self._ref_proc_size = (proc_w, proc_h)
+        logger.debug(f"Reference frame loaded at {proc_w}x{proc_h}.")
+        return self._ref_gray_proc
+
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -149,7 +207,29 @@ class InferenceService:
             )
             mask_roi = cv2.erode(mask_roi, erode_se, iterations=1)
 
-        # ── 4. Local variance on the UNSMOOTHED CLAHE image ─────────────────
+        # ── 4a. Background subtraction (primary signal) ──────────────────────
+        #   If a reference frame of the empty bed has been saved, compute the
+        #   absolute per-pixel diff between the current CLAHE image and the
+        #   reference CLAHE image.  Pixels that changed significantly are where
+        #   a workpiece has been placed.
+        ref_gray = self._load_ref_gray(proc_w, proc_h)
+        if ref_gray is not None:
+            abs_diff = cv2.absdiff(enhanced, ref_gray)
+            # Blur before thresholding to reduce isolated noise pixels
+            abs_diff_blurred = cv2.GaussianBlur(abs_diff, (smooth_k, smooth_k), 0)
+            _, diff_mask_raw = cv2.threshold(
+                abs_diff_blurred, self.diff_threshold, 255, cv2.THRESH_BINARY
+            )
+            diff_mask = cv2.bitwise_and(diff_mask_raw, diff_mask_raw, mask=mask_roi)
+            logger.debug(
+                f"Background diff: threshold={self.diff_threshold}, "
+                f"changed_px={cv2.countNonZero(diff_mask)}"
+            )
+        else:
+            diff_mask = np.zeros((proc_h, proc_w), dtype=np.uint8)
+            logger.debug("No reference frame — skipping background subtraction.")
+
+        # ── 4b. Local variance on the UNSMOOTHED CLAHE image ─────────────────
         #    Variance = E[X²] − E[X]²   (two box filters, very fast)
         #
         #    var_k must span 2+ honeycomb cells so the window sees wall
@@ -167,25 +247,31 @@ class InferenceService:
         roi_var = local_var[mask_roi > 0]
         if len(roi_var) == 0:
             logger.warning("ROI is empty — cannot detect objects.")
-            return []
+            empty = np.zeros((proc_h, proc_w), dtype=np.uint8)
+            return [], empty, empty, empty, proc_w, proc_h
 
-        # Use configurable percentile + multiplier — tune via debug Panel C.
-        # A solid workpiece is typically <25% of the honeycomb variance.
         hc_baseline = float(np.percentile(roi_var, self.variance_percentile))
         var_thresh   = hc_baseline * self.variance_multiplier
 
         logger.debug(
-            f"Variance: HC baseline (p60)={hc_baseline:.1f}, "
-            f"threshold={var_thresh:.1f}, "
-            f"ROI var min={float(roi_var.min()):.1f}, "
-            f"ROI var max={float(roi_var.max()):.1f}"
+            f"Variance: baseline(p{self.variance_percentile:.0f})={hc_baseline:.1f}, "
+            f"threshold={var_thresh:.1f}"
         )
 
-        # Binary mask: low-variance pixels inside the ROI
         low_var = (local_var < var_thresh).astype(np.uint8) * 255
-        workpiece_mask = cv2.bitwise_and(low_var, low_var, mask=mask_roi)
-        # Keep a copy of the raw threshold mask for the debug panel
-        raw_var_mask = workpiece_mask.copy()
+        var_mask_roi = cv2.bitwise_and(low_var, low_var, mask=mask_roi)
+        raw_var_mask = var_mask_roi.copy()  # for debug panel
+
+        # ── 5b. Combine diff + variance (OR) ────────────────────────────────
+        #   OR gives maximum recall: detect anything that changed OR has
+        #   anomalous texture (useful when reference isn’t perfectly matched).
+        if ref_gray is not None:
+            workpiece_mask = cv2.bitwise_or(diff_mask, var_mask_roi)
+            logger.debug("Using diff OR variance combined mask.")
+        else:
+            workpiece_mask = var_mask_roi
+            logger.debug("Using variance-only mask (no reference).")
+
 
         # ── 6. Two-pass morphology on variance mask ──────────────────────────
         #   Pass A — small close: fills individual cell holes within a blob
@@ -209,33 +295,46 @@ class InferenceService:
         logger.debug(f"Variance blobs before area filter: {len(var_contours)}")
 
         # ── 8. Edge-refinement stage ─────────────────────────────────────────
-        #   For each variance blob:
-        #     a) Extract a padded bounding-box region from the CLAHE image
-        #     b) Apply a large Gaussian blur (> cell diameter) — this kills the
-        #        fine honeycomb cell edges while preserving the much larger
-        #        workpiece boundary
-        #     c) Run Canny — the dominant edges left are the workpiece outline
-        #     d) Find the largest closed contour inside the padded region
-        #     e) If a good edge contour is found, use it; otherwise fall back
-        #        to the variance blob (handles dark materials with low contrast)
         #
-        # edge_blur_k only needs to exceed one honeycomb cell diameter to suppress
-        # individual cell-wall edges. Using var_k (which spans 2+ cells) was far
-        # too large and washed out the workpiece boundary entirely.
-        # morph_k already represents one cell span at the working resolution.
-        edge_blur_k = self._odd(morph_k * 2)
-        edge_blurred = cv2.GaussianBlur(enhanced, (edge_blur_k, edge_blur_k), 0)
+        #   Strategy: run Canny on the lightly-smoothed CLAHE image, then
+        #   restrict it to a "boundary ring" built from the variance blob.
+        #
+        #   The ring is: dilate(blob) − blob  ← just the perimeter pixels.
+        #   Because the ring only covers the transition zone between the
+        #   workpiece and the bed, honeycomb edges (which are far outside
+        #   the blob) are never even considered by Canny.
+        #
+        #   This avoids the blur-vs-cell-edges arms race entirely.
 
-        # Canny thresholds: low = 20% of high to catch weak workpiece boundaries
+        # Light blur — just enough to reduce sensor noise for Canny
+        canny_blur_k = self._odd(smooth_k)
+        canny_blurred = cv2.GaussianBlur(enhanced, (canny_blur_k, canny_blur_k), 0)
+
         canny_high = float(os.getenv("DETECT_CANNY_HIGH", "60"))
         canny_low  = canny_high * 0.2
-        canny_edges = cv2.Canny(edge_blurred, canny_low, canny_high)
+        canny_full = cv2.Canny(canny_blurred, canny_low, canny_high)
+        canny_full = cv2.bitwise_and(canny_full, canny_full, mask=mask_roi)
 
-        # Restrict Canny output to inside the ROI only
-        canny_edges = cv2.bitwise_and(canny_edges, canny_edges, mask=mask_roi)
+        # Build boundary ring around the morphologically cleaned mask
+        ring_k  = self._odd(large_k)   # ring width ~ one workpiece-merge kernel
+        ring_se = cv2.getStructuringElement(cv2.MORPH_RECT, (ring_k, ring_k))
+        blob_dilated = cv2.dilate(dilated, ring_se, iterations=1)
+        blob_ring    = cv2.subtract(blob_dilated, dilated)  # perimeter only
 
-        # Keep the full Canny map for the debug panel (Panel D)
-        debug_canny = canny_edges.copy()
+        # Restrict Canny to the boundary ring — these are the workpiece edges
+        boundary_canny = cv2.bitwise_and(canny_full, canny_full, mask=blob_ring)
+
+        # Dilate boundary edges slightly to close any gaps in the outline
+        gap_se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        boundary_canny_closed = cv2.dilate(boundary_canny, gap_se, iterations=1)
+
+        # Store for debug panel D (show full Canny + ring overlay)
+        debug_canny = canny_full.copy()
+        # Tint the active ring brighter so it's visible alongside the full map
+        debug_canny = np.where(blob_ring[..., None] > 0,
+                               np.full_like(debug_canny[..., None], 200),
+                               debug_canny[..., None]).squeeze()
+        debug_canny = debug_canny.astype(np.uint8)
 
         results = []
         from .calibration import calibration_service as cal
@@ -245,44 +344,49 @@ class InferenceService:
             if area_proc < min_area or area_proc > (proc_w * proc_h * 0.5):
                 continue
 
-            # Pad the bounding box so edge detection can see the workpiece boundary
-            pad = large_k
-            bx, by, bw, bh = cv2.boundingRect(var_cnt)
-            x1 = max(0, bx - pad);  y1 = max(0, by - pad)
-            x2 = min(proc_w, bx + bw + pad);  y2 = min(proc_h, by + bh + pad)
+            # Create a single-blob mask for this contour
+            single_blob = np.zeros((proc_h, proc_w), dtype=np.uint8)
+            cv2.fillPoly(single_blob, [var_cnt], 255)
 
-            # Extract Canny edges within the padded region
-            region_edges = canny_edges[y1:y2, x1:x2].copy()
+            # Build boundary ring for this specific blob
+            blob_ring_single = cv2.dilate(single_blob, ring_se, iterations=1)
+            blob_ring_single = cv2.subtract(blob_ring_single, single_blob)
 
-            # Dilate edges slightly to close gaps in the workpiece outline
-            gap_se = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-            region_edges = cv2.dilate(region_edges, gap_se, iterations=1)
+            # Canny edges restricted to this blob's boundary ring
+            region_edges = cv2.bitwise_and(
+                boundary_canny_closed, boundary_canny_closed, mask=blob_ring_single
+            )
 
             edge_cnts, _ = cv2.findContours(
                 region_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
 
-            # Pick the largest edge contour that is at least 30% of the variance blob
+            # Pick the largest edge contour that is meaningful
             best_edge_cnt = None
             if edge_cnts:
                 edge_cnts_sorted = sorted(edge_cnts, key=cv2.contourArea, reverse=True)
-                for ec in edge_cnts_sorted:
-                    if cv2.contourArea(ec) >= area_proc * 0.3:
-                        best_edge_cnt = ec
-                        break
+                candidate = edge_cnts_sorted[0]
+                if cv2.contourArea(candidate) >= min_area * 0.3:
+                    best_edge_cnt = candidate
 
             if best_edge_cnt is not None:
-                # Translate edge contour back to proc-space coordinates
-                refined_cnt = best_edge_cnt + np.array([[[x1, y1]]], dtype=np.int32)
+                # Combine the variance blob fill + the refined boundary contour
+                # so the final shape covers the full interior, not just the ring
+                refined_mask = single_blob.copy()
+                cv2.drawContours(refined_mask, [best_edge_cnt], -1, 255,
+                                 thickness=cv2.FILLED)
+                refined_cnts, _ = cv2.findContours(
+                    refined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                refined_cnt = max(refined_cnts, key=cv2.contourArea) \
+                    if refined_cnts else var_cnt
                 logger.debug(
-                    f"Blob {i}: edge contour found "
-                    f"({cv2.contourArea(best_edge_cnt):.0f} px² in region)"
+                    f"Blob {i}: edge-refined "
+                    f"({cv2.contourArea(best_edge_cnt):.0f} px² ring)"
                 )
             else:
-                # Fall back to the variance blob — typically dark materials
-                # where brightness contrast against the bed is low
                 refined_cnt = var_cnt
-                logger.debug(f"Blob {i}: no edge contour — using variance blob fallback")
+                logger.debug(f"Blob {i}: using variance blob (no boundary edges found)")
 
             # ── Scale to full-res and map to mm ─────────────────────────────
             if ds < 1.0:
@@ -337,7 +441,7 @@ class InferenceService:
         logger.info(
             f"Detection complete: {len(results)} workpiece(s) in {elapsed:.2f}s"
         )
-        return results, raw_var_mask, debug_canny, proc_w, proc_h
+        return results, raw_var_mask, diff_mask, debug_canny, proc_w, proc_h
 
     # ── Debug Image ────────────────────────────────────────────────────────────
 
@@ -345,15 +449,14 @@ class InferenceService:
         self, image: np.ndarray, results: List[Dict],
         mean_brightness: float,
         var_mask_proc: np.ndarray | None = None,
+        diff_mask_proc: np.ndarray | None = None,
         canny_proc: np.ndarray | None = None,
         proc_w: int = 0, proc_h: int = 0,
     ) -> None:
         """
-        Save a 4-panel diagnostic composite:
-          Panel A (left)    — raw frame with detection overlays
-          Panel B           — CLAHE-enhanced grayscale (detector input)
-          Panel C           — variance threshold mask (pre-morphology, cyan=workpiece)
-          Panel D (right)   — Canny edge map after large-kernel blur (yellow edges)
+        Save a 5-panel diagnostic composite (3-top + 2-bottom grid):
+          [A] RAW frame + overlays   [B] CLAHE input   [C] Variance mask (cyan)
+          [D] Background diff (magenta)                [E] Canny edges (yellow)
         """
         debug_path = "calibration_data/detect_debug.jpg"
         os.makedirs(os.path.dirname(debug_path), exist_ok=True)
@@ -400,30 +503,47 @@ class InferenceService:
             else:
                 panel_c = np.zeros((th, tw, 3), dtype=np.uint8)
 
-            # Panel D: Canny edges (yellow on black)
-            if canny_proc is not None and canny_proc.size > 0:
+            # Panel D: background diff (magenta = changed pixels)
+            if diff_mask_proc is not None and diff_mask_proc.size > 0:
                 panel_d = cv2.cvtColor(
+                    cv2.resize(diff_mask_proc, (tw, th), interpolation=cv2.INTER_NEAREST),
+                    cv2.COLOR_GRAY2BGR
+                )
+                mag_tint = np.zeros_like(panel_d)
+                mag_tint[panel_d[:, :, 0] > 128] = [255, 0, 255]  # magenta
+                panel_d = cv2.addWeighted(panel_d, 0.0, mag_tint, 1.0, 0)
+            else:
+                panel_d = np.zeros((th, tw, 3), dtype=np.uint8)
+                cv2.putText(panel_d, "No reference frame", (10, th // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 1)
+
+            # Panel E: Canny boundary edges (yellow)
+            if canny_proc is not None and canny_proc.size > 0:
+                panel_e = cv2.cvtColor(
                     cv2.resize(canny_proc, (tw, th), interpolation=cv2.INTER_NEAREST),
                     cv2.COLOR_GRAY2BGR
                 )
-                yellow_tint = np.zeros_like(panel_d)
-                yellow_tint[panel_d[:, :, 0] > 128] = [0, 255, 255]  # yellow = G+R
-                panel_d = cv2.addWeighted(panel_d, 0.0, yellow_tint, 1.0, 0)
+                yellow_tint = np.zeros_like(panel_e)
+                yellow_tint[panel_e[:, :, 0] > 128] = [0, 255, 255]
+                panel_e = cv2.addWeighted(panel_e, 0.0, yellow_tint, 1.0, 0)
             else:
-                panel_d = np.zeros((th, tw, 3), dtype=np.uint8)
+                panel_e = np.zeros((th, tw, 3), dtype=np.uint8)
 
-            lbl = dict(
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.6,
-                color=(0, 255, 255), thickness=2,
-            )
-            cv2.putText(panel_a, f"RAW  mean={mean_brightness:.0f}", (10, 30), **lbl)
-            cv2.putText(panel_b, "CLAHE (detector input)", (10, 30), **lbl)
-            cv2.putText(panel_c, "Variance mask (cyan=workpiece)", (10, 30), **lbl)
-            cv2.putText(panel_d, "Canny edges (yellow=boundary)", (10, 30), **lbl)
+            lbl = dict(fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.55,
+                       color=(0, 255, 255), thickness=2)
+            cv2.putText(panel_a, f"A: RAW  mean={mean_brightness:.0f}", (10, 28), **lbl)
+            cv2.putText(panel_b, "B: CLAHE input", (10, 28), **lbl)
+            cv2.putText(panel_c, "C: Variance (cyan)", (10, 28), **lbl)
+            has_ref = "YES" if (diff_mask_proc is not None and diff_mask_proc.any()) else "NO REF"
+            cv2.putText(panel_d, f"D: Diff/BG sub ({has_ref})", (10, 28), **lbl)
+            cv2.putText(panel_e, "E: Canny boundary", (10, 28), **lbl)
 
-            # 2×2 grid: easier to view than a 4-wide strip
-            top_row    = np.hstack([panel_a, panel_b])
-            bottom_row = np.hstack([panel_c, panel_d])
+            # 3-top + 2-bottom layout
+            top_row    = np.hstack([panel_a, panel_b, panel_c])
+            # Pad D and E to match top_row width
+            pad_w = top_row.shape[1] - tw * 2
+            pad = np.zeros((th, pad_w, 3), dtype=np.uint8)
+            bottom_row = np.hstack([panel_d, panel_e, pad])
             cv2.imwrite(debug_path, np.vstack([top_row, bottom_row]))
         except Exception as e:
             logger.warning(f"Debug composite failed: {e}")
@@ -454,8 +574,11 @@ class InferenceService:
                 "AE may still be settling — results may be unreliable."
             )
 
-        results, raw_var_mask, debug_canny, proc_w, proc_h = self._detect_objects(image)
-        self._save_debug_image(image, results, mean_brightness, raw_var_mask, debug_canny, proc_w, proc_h)
+        results, raw_var_mask, diff_mask, debug_canny, proc_w, proc_h = self._detect_objects(image)
+        self._save_debug_image(
+            image, results, mean_brightness,
+            raw_var_mask, diff_mask, debug_canny, proc_w, proc_h
+        )
         return results
 
 
