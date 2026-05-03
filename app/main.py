@@ -66,6 +66,7 @@ class CalibrationPoint(BaseModel):
     physical_x: float
     physical_y: float
     size_mm: Optional[float] = None
+    guide_mm: Optional[float] = 0.0
     anchor: str = "center"
 
 class CalibrationRequest(BaseModel):

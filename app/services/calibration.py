@@ -190,13 +190,11 @@ class CalibrationService:
                 # Map corners based on the specified anchor and tag size
                 if 'size_mm' in p:
                     s = p['size_mm']
+                    g = p.get('guide_mm', 0.0)
                     half = s / 2.0
                     px, py = p['x'], p['y']
                     anchor = p.get('anchor', 'center').lower().replace('_', '-')
                     
-                    # Aruco corners are always returned in order: TL, TR, BR, BL
-                    # Physical coordinates use Cartesian convention: Y increases upward.
-                    # So 'top' means HIGHER Y value, 'bottom' means LOWER Y value.
                     if anchor == 'center':
                         target_corners = [
                             [px - half, py + half], # TL (left, up)
@@ -205,36 +203,32 @@ class CalibrationService:
                             [px - half, py - half]  # BL (left, down)
                         ]
                     elif anchor in ['top-left', 'tl']:
-                        # anchor point is the top-left corner of the tag
                         target_corners = [
-                            [px,     py    ],  # TL
-                            [px + s, py    ],  # TR
-                            [px + s, py - s],  # BR
-                            [px,     py - s]   # BL
+                            [px + g,     py - g    ],  # TL
+                            [px + g + s, py - g    ],  # TR
+                            [px + g + s, py - g - s],  # BR
+                            [px + g,     py - g - s]   # BL
                         ]
                     elif anchor in ['top-right', 'tr']:
-                        # anchor point is the top-right corner of the tag
                         target_corners = [
-                            [px - s, py    ],  # TL
-                            [px,     py    ],  # TR
-                            [px,     py - s],  # BR
-                            [px - s, py - s]   # BL
+                            [px - g - s, py - g    ],  # TL
+                            [px - g,     py - g    ],  # TR
+                            [px - g,     py - g - s],  # BR
+                            [px - g - s, py - g - s]   # BL
                         ]
                     elif anchor in ['bottom-right', 'br']:
-                        # anchor point is the bottom-right corner of the tag
                         target_corners = [
-                            [px - s, py + s],  # TL
-                            [px,     py + s],  # TR
-                            [px,     py    ],  # BR
-                            [px - s, py    ]   # BL
+                            [px - g - s, py + g + s],  # TL
+                            [px - g,     py + g + s],  # TR
+                            [px - g,     py + g    ],  # BR
+                            [px - g - s, py + g    ]   # BL
                         ]
                     elif anchor in ['bottom-left', 'bl']:
-                        # anchor point is the bottom-left corner of the tag
                         target_corners = [
-                            [px,     py + s],  # TL
-                            [px + s, py + s],  # TR
-                            [px + s, py    ],  # BR
-                            [px,     py    ]   # BL
+                            [px + g,     py + g + s],  # TL
+                            [px + g + s, py + g + s],  # TR
+                            [px + g + s, py + g    ],  # BR
+                            [px + g,     py + g    ]   # BL
                         ]
                     else:
                         # Default to center
@@ -254,8 +248,11 @@ class CalibrationService:
         src_pts = np.array(src_pts, dtype=np.float32)
         dst_pts = np.array(dst_pts, dtype=np.float32)
         
-        # Use RANSAC to filter out noisy tag detections
-        matrix, status = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        # Use least-squares (0) instead of RANSAC. Aruco IDs guarantee correct 
+        # correspondences, and RANSAC can incorrectly discard entire tags if minor 
+        # lens distortion makes them slightly non-planar, causing the matrix to 
+        # overfit to a single tag.
+        matrix, status = cv2.findHomography(src_pts, dst_pts, 0)
         
         if matrix is not None:
             calib_data = {
@@ -399,7 +396,26 @@ class CalibrationService:
             center_px_f = corners.mean(axis=0).reshape(1, 2).astype(np.float32)
             center_mm = self.map_pixels_to_mm(center_px_f)[0]
 
-            expected_mm = np.array([p["x"], p["y"]], dtype=np.float32)
+            s = p.get("size_mm", 50.0)
+            g = p.get("guide_mm", 0.0)
+            half = s / 2.0
+            px, py = p["x"], p["y"]
+            anchor = p.get("anchor", "center").lower().replace('_', '-')
+
+            if anchor == 'center':
+                expected_center = [px, py]
+            elif anchor in ['top-left', 'tl']:
+                expected_center = [px + g + half, py - g - half]
+            elif anchor in ['top-right', 'tr']:
+                expected_center = [px - g - half, py - g - half]
+            elif anchor in ['bottom-right', 'br']:
+                expected_center = [px - g - half, py + g + half]
+            elif anchor in ['bottom-left', 'bl']:
+                expected_center = [px + g + half, py + g + half]
+            else:
+                expected_center = [px, py]
+
+            expected_mm = np.array(expected_center, dtype=np.float32)
             error_mm = float(np.linalg.norm(center_mm - expected_mm))
 
             per_tag_errors.append({
