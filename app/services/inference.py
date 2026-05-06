@@ -112,7 +112,7 @@ class InferenceService:
         Run the detection pipeline on an already-undistorted frame.
 
         Returns:
-            (results, raw_thresh_mask, candidate_mask, canny_diag, proc_w, proc_h)
+            (results, raw_thresh_mask, candidate_mask, canny_diag, proc_w, proc_h, tags_full)
         """
         orig_h, orig_w = image.shape[:2]
         t0 = time.monotonic()
@@ -367,7 +367,7 @@ class InferenceService:
 
         elapsed = time.monotonic() - t0
         logger.info(f"Detection: {len(results)} workpiece(s) in {elapsed:.3f}s")
-        return results, raw_mask, candidate_mask, canny_diag, proc_w, proc_h
+        return results, raw_mask, candidate_mask, canny_diag, proc_w, proc_h, tags_full
 
     # ── Debug Composite ────────────────────────────────────────────────────────
 
@@ -381,6 +381,7 @@ class InferenceService:
         canny_diag: np.ndarray | None,
         proc_w: int,
         proc_h: int,
+        tags_full: List[Dict] = None
     ) -> None:
         """
         Write a 5-panel 3+2 grid to calibration_data/detect_debug.jpg:
@@ -391,9 +392,46 @@ class InferenceService:
         debug_path = "calibration_data/detect_debug.jpg"
         os.makedirs(os.path.dirname(debug_path), exist_ok=True)
 
+        x_offset, y_offset = 0, 0
+        if tags_full and len(tags_full) >= 3:
+            pts = np.vstack([np.array(t['corners'], dtype=np.int32) for t in tags_full])
+            tx, ty, tw_b, th_b = cv2.boundingRect(pts)
+            pad = 20
+            x1 = max(0, tx - pad)
+            y1 = max(0, ty - pad)
+            x2 = min(image.shape[1], tx + tw_b + pad)
+            y2 = min(image.shape[0], ty + th_b + pad)
+            
+            image = image[y1:y2, x1:x2]
+            x_offset, y_offset = x1, y1
+            
+            # Crop the masks mapped from proc resolution
+            ds_x = proc_w / float(x_offset + image.shape[1] + (x_offset == 0 and image.shape[1] or 0)) # prevent division issues
+            ds_y = proc_h / float(y_offset + image.shape[0] + (y_offset == 0 and image.shape[0] or 0))
+            # Actually, ds_x and ds_y should just be based on the original image dimensions before cropping.
+            ds_x = proc_w / float(image.shape[1] if x_offset == 0 else image.shape[1] + x2 - x1) 
+            # Re-calculating with safe original dims:
+            orig_w_full = x_offset + image.shape[1] if x_offset > 0 else image.shape[1]
+            orig_h_full = y_offset + image.shape[0] if y_offset > 0 else image.shape[0]
+            # When x_offset > 0, image was already cropped, its shape[1] is x2 - x1.
+            orig_w_full = x_offset + image.shape[1]
+            orig_h_full = y_offset + image.shape[0]
+
+            ds_x = proc_w / float(orig_w_full)
+            ds_y = proc_h / float(orig_h_full)
+            
+            mx1, my1 = int(x1 * ds_x), int(y1 * ds_y)
+            mx2, my2 = int(x2 * ds_x), int(y2 * ds_y)
+            
+            if raw_mask is not None: raw_mask = raw_mask[my1:my2, mx1:mx2]
+            if candidate_mask is not None: candidate_mask = candidate_mask[my1:my2, mx1:mx2]
+            if canny_diag is not None: canny_diag = canny_diag[my1:my2, mx1:mx2]
+
         overlay = image.copy()
         for wp in results:
             pts     = np.array(wp['corners_px'], dtype=np.int32)
+            pts[:, 0] -= x_offset
+            pts[:, 1] -= y_offset
             cx      = int(pts[:, 0].mean())
             cy      = int(pts[:, 1].mean())
             angle_r = math.radians(wp.get('angle_deg', 0))
@@ -427,13 +465,14 @@ class InferenceService:
             s     = min(1.0, MAX_W / w)
             tw, th = int(w * s), int(h * s)
 
-            panel_a = cv2.resize(overlay, (tw, th))
+            panel_a = cv2.resize(image, (tw, th))
+            panel_b = cv2.resize(overlay, (tw, th))
 
-            # CLAHE base — reused as the background for panels B, C, D, E
-            gray_b   = cv2.cvtColor(cv2.resize(image, (tw, th)), cv2.COLOR_BGR2GRAY)
-            clahe_b  = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray_b)
-            base_bgr = cv2.cvtColor(clahe_b, cv2.COLOR_GRAY2BGR)
-            panel_b  = base_bgr.copy()
+            # CLAHE base — reused as the background for panels C, D, E, F
+            gray_c   = cv2.cvtColor(cv2.resize(image, (tw, th)), cv2.COLOR_BGR2GRAY)
+            clahe_c  = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray_c)
+            base_bgr = cv2.cvtColor(clahe_c, cv2.COLOR_GRAY2BGR)
+            panel_c  = base_bgr.copy()
 
             def _overlay(mask: np.ndarray | None, color_bgr: tuple,
                          alpha: float = 0.55) -> np.ndarray:
@@ -453,23 +492,23 @@ class InferenceService:
                 )[where]
                 return out
 
-            panel_c = _overlay(raw_mask,      (255,  50, 180))   # magenta — raw threshold
-            panel_d = _overlay(candidate_mask, (0,   230, 230))   # yellow  — candidates
-            panel_e = _overlay(canny_diag,     (0,   255, 100))   # green   — canny diag
+            panel_d = _overlay(raw_mask,      (255,  50, 180))   # magenta — raw threshold
+            panel_e = _overlay(candidate_mask, (0,   230, 230))   # yellow  — candidates
+            panel_f = _overlay(canny_diag,     (0,   255, 100))   # green   — canny diag
 
             lbl = dict(fontFace=cv2.FONT_HERSHEY_SIMPLEX,
                        fontScale=0.5, color=(0, 255, 255), thickness=2)
             has_ref = "ref" if self.has_reference else "no-ref"
-            cv2.putText(panel_a, f"A: RAW  mean={mean_brightness:.0f}", (8, 24), **lbl)
-            cv2.putText(panel_b, "B: CLAHE input", (8, 24), **lbl)
-            cv2.putText(panel_c, f"C: Threshold ({has_ref})", (8, 24), **lbl)
-            cv2.putText(panel_d, "D: Candidates (hull+close)", (8, 24), **lbl)
-            cv2.putText(panel_e, "E: Canny (diag only)", (8, 24), **lbl)
+            
+            cv2.putText(panel_a, "A: Original Undistorted", (8, 24), **lbl)
+            cv2.putText(panel_b, f"B: Overlays  mean={mean_brightness:.0f}", (8, 24), **lbl)
+            cv2.putText(panel_c, "C: CLAHE input", (8, 24), **lbl)
+            cv2.putText(panel_d, f"D: Threshold ({has_ref})", (8, 24), **lbl)
+            cv2.putText(panel_e, "E: Candidates (hull+close)", (8, 24), **lbl)
+            cv2.putText(panel_f, "F: Canny (diag only)", (8, 24), **lbl)
 
             top_row    = np.hstack([panel_a, panel_b, panel_c])
-            pad_w      = top_row.shape[1] - tw * 2
-            bottom_row = np.hstack([panel_d, panel_e,
-                                    np.zeros((th, pad_w, 3), dtype=np.uint8)])
+            bottom_row = np.hstack([panel_d, panel_e, panel_f])
             cv2.imwrite(debug_path, np.vstack([top_row, bottom_row]))
         except Exception as exc:
             logger.warning(f"Debug composite failed: {exc}")
@@ -499,12 +538,12 @@ class InferenceService:
                 "AE may still be settling."
             )
 
-        results, raw_mask, candidate_mask, canny_diag, pw, ph = \
+        results, raw_mask, candidate_mask, canny_diag, pw, ph, tags = \
             self._detect_objects(image)
 
         self._save_debug_image(
             image, results, mean_brightness,
-            raw_mask, candidate_mask, canny_diag, pw, ph,
+            raw_mask, candidate_mask, canny_diag, pw, ph, tags
         )
         return results
 
