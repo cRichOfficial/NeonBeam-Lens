@@ -226,6 +226,33 @@ class InferenceService:
         # Restrict to ROI
         raw_mask = cv2.bitwise_and(raw_mask, raw_mask, mask=mask_roi)
 
+        # ── 4b. HSV saturation hint mask ──────────────────────────────────────
+        #
+        #  The honeycomb bed is almost completely achromatic (dark gray), so any
+        #  pixel with meaningful color saturation is almost certainly a workpiece.
+        #  This is especially important for reflective / metallic colored objects
+        #  (e.g. anodized aluminum) whose brightness varies so much across the
+        #  surface that the diff mask splits them into disconnected fragments.
+        #
+        #  The hint mask is OR-combined with raw_mask BEFORE the grouping step,
+        #  ensuring a single continuous blob is seen by the convex-hull grouper.
+        #
+        #  DETECT_SAT_THRESHOLD: HSV saturation (0–255) above which a pixel is
+        #  considered colored foreground. 0 disables the hint. Default = 40.
+        sat_threshold = int(os.getenv("DETECT_SAT_THRESHOLD", "40"))
+        if sat_threshold > 0:
+            hsv      = cv2.cvtColor(proc, cv2.COLOR_BGR2HSV)
+            sat_ch   = hsv[:, :, 1]                          # 0–255 saturation
+            sat_blur = cv2.GaussianBlur(sat_ch, (smooth_k, smooth_k), 0)
+            _, sat_mask = cv2.threshold(sat_blur, sat_threshold, 255, cv2.THRESH_BINARY)
+            sat_mask = cv2.bitwise_and(sat_mask, sat_mask, mask=mask_roi)
+            px_before = cv2.countNonZero(raw_mask)
+            raw_mask  = cv2.bitwise_or(raw_mask, sat_mask)
+            logger.debug(
+                f"Sat-hint: threshold={sat_threshold}  "
+                f"added {cv2.countNonZero(raw_mask) - px_before} px"
+            )
+
         # ── 5. Grouped convex hull (Object-aware) ─────────────────────────────
         #
         #  Wood grain / uneven lighting splits a single workpiece into several
