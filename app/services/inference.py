@@ -517,6 +517,37 @@ class InferenceService:
             panel_e = _overlay(candidate_mask, (0,   230, 230))   # yellow  — candidates
             panel_f = _overlay(canny_diag,     (0,   255, 100))   # green   — canny diag
 
+            # ── Row 3: reference frame + raw diff images ──────────────────────
+            # Load the reference at display resolution and compute the pre-
+            # threshold diff arrays so the user can see what the subtraction
+            # looks like before any thresholding is applied.
+            _BLACK = np.zeros((th, tw, 3), dtype=np.uint8)
+
+            ref_raw = cv2.imread(self._REFERENCE_PATH) if self.has_reference else None
+            if ref_raw is not None:
+                ref_display = cv2.resize(ref_raw, (tw, th), interpolation=cv2.INTER_AREA)
+                panel_g = ref_display.copy()
+
+                # Brightness diff (abs) — HOT colormap: brighter = bigger change
+                img_small = cv2.resize(image, (tw, th))
+                igray = cv2.cvtColor(img_small,   cv2.COLOR_BGR2GRAY).astype(np.int16)
+                rgray = cv2.cvtColor(ref_display, cv2.COLOR_BGR2GRAY).astype(np.int16)
+                bdiff = np.clip(np.abs(igray - rgray), 0, 255).astype(np.uint8)
+                panel_h = cv2.applyColorMap(bdiff, cv2.COLORMAP_HOT)
+
+                # Saturation gained vs reference — COOL colormap: brighter = more colour
+                ihsv  = cv2.cvtColor(img_small,   cv2.COLOR_BGR2HSV)
+                rhsv  = cv2.cvtColor(ref_display, cv2.COLOR_BGR2HSV)
+                sdiff = np.clip(
+                    ihsv[:, :, 1].astype(np.int16) - rhsv[:, :, 1].astype(np.int16),
+                    0, 255,
+                ).astype(np.uint8)
+                panel_i = cv2.applyColorMap(sdiff, cv2.COLORMAP_COOL)
+            else:
+                panel_g = _BLACK.copy()
+                panel_h = _BLACK.copy()
+                panel_i = _BLACK.copy()
+
             lbl = dict(fontFace=cv2.FONT_HERSHEY_SIMPLEX,
                        fontScale=0.5, color=(0, 255, 255), thickness=2)
             has_ref = "ref" if self.has_reference else "no-ref"
@@ -526,10 +557,14 @@ class InferenceService:
             cv2.putText(panel_d, f"D: Threshold ({has_ref})", (8, 24), **lbl)
             cv2.putText(panel_e, "E: Candidates (hull+close)", (8, 24), **lbl)
             cv2.putText(panel_f, "F: Canny (diag only)", (8, 24), **lbl)
+            cv2.putText(panel_g, "G: Reference frame", (8, 24), **lbl)
+            cv2.putText(panel_h, "H: Brightness diff (pre-threshold)", (8, 24), **lbl)
+            cv2.putText(panel_i, "I: Saturation diff (pre-threshold)", (8, 24), **lbl)
 
             top_row    = np.hstack([panel_a, panel_b, panel_c])
-            bottom_row = np.hstack([panel_d, panel_e, panel_f])
-            cv2.imwrite(debug_path, np.vstack([top_row, bottom_row]))
+            mid_row    = np.hstack([panel_d, panel_e, panel_f])
+            bottom_row = np.hstack([panel_g, panel_h, panel_i])
+            cv2.imwrite(debug_path, np.vstack([top_row, mid_row, bottom_row]))
         except Exception as exc:
             logger.warning(f"Debug composite failed: {exc}")
             cv2.imwrite(debug_path, overlay)
