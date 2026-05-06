@@ -383,10 +383,10 @@ class InferenceService:
         proc_h: int,
     ) -> None:
         """
-        Write a 6-panel 3x2 grid to calibration_data/detect_debug.jpg:
+        Write a 5-panel 3+2 grid to calibration_data/detect_debug.jpg:
 
-          [A] Original undistorted  [B] Overlays  [C] CLAHE input
-          [D] Threshold/diff mask   [E] Candidates (hull+close)  [F] Canny (diag only)
+          [A] Raw frame + overlays  [B] CLAHE input  [C] Threshold/diff mask
+          [D] Candidate mask (after hull fill + close)  [E] Canny (diag only)
         """
         debug_path = "calibration_data/detect_debug.jpg"
         os.makedirs(os.path.dirname(debug_path), exist_ok=True)
@@ -427,14 +427,13 @@ class InferenceService:
             s     = min(1.0, MAX_W / w)
             tw, th = int(w * s), int(h * s)
 
-            panel_a = cv2.resize(image, (tw, th))
-            panel_b = cv2.resize(overlay, (tw, th))
+            panel_a = cv2.resize(overlay, (tw, th))
 
-            # CLAHE base — reused as the background for panels C, D, E, F
-            gray_c   = cv2.cvtColor(cv2.resize(image, (tw, th)), cv2.COLOR_BGR2GRAY)
-            clahe_c  = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray_c)
-            base_bgr = cv2.cvtColor(clahe_c, cv2.COLOR_GRAY2BGR)
-            panel_c  = base_bgr.copy()
+            # CLAHE base — reused as the background for panels B, C, D, E
+            gray_b   = cv2.cvtColor(cv2.resize(image, (tw, th)), cv2.COLOR_BGR2GRAY)
+            clahe_b  = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray_b)
+            base_bgr = cv2.cvtColor(clahe_b, cv2.COLOR_GRAY2BGR)
+            panel_b  = base_bgr.copy()
 
             def _overlay(mask: np.ndarray | None, color_bgr: tuple,
                          alpha: float = 0.55) -> np.ndarray:
@@ -454,20 +453,21 @@ class InferenceService:
                 )[where]
                 return out
 
-            panel_d = _overlay(raw_mask,      (255,  50, 180))   # magenta — raw threshold
-            panel_e = _overlay(candidate_mask, (0,   230, 230))   # yellow  — candidates
-            panel_f = _overlay(canny_diag,     (0,   255, 100))   # green   — canny diag
+            panel_c = _overlay(raw_mask,      (255,  50, 180))   # magenta — raw threshold
+            panel_d = _overlay(candidate_mask, (0,   230, 230))   # yellow  — candidates
+            panel_e = _overlay(canny_diag,     (0,   255, 100))   # green   — canny diag
 
+            panel_f = cv2.resize(image, (tw, th))
+            
             lbl = dict(fontFace=cv2.FONT_HERSHEY_SIMPLEX,
                        fontScale=0.5, color=(0, 255, 255), thickness=2)
             has_ref = "ref" if self.has_reference else "no-ref"
-            
-            cv2.putText(panel_a, "A: Original Undistorted", (8, 24), **lbl)
-            cv2.putText(panel_b, f"B: Overlays  mean={mean_brightness:.0f}", (8, 24), **lbl)
-            cv2.putText(panel_c, "C: CLAHE input", (8, 24), **lbl)
-            cv2.putText(panel_d, f"D: Threshold ({has_ref})", (8, 24), **lbl)
-            cv2.putText(panel_e, "E: Candidates (hull+close)", (8, 24), **lbl)
-            cv2.putText(panel_f, "F: Canny (diag only)", (8, 24), **lbl)
+            cv2.putText(panel_a, f"A: RAW  mean={mean_brightness:.0f}", (8, 24), **lbl)
+            cv2.putText(panel_b, "B: CLAHE input", (8, 24), **lbl)
+            cv2.putText(panel_c, f"C: Threshold ({has_ref})", (8, 24), **lbl)
+            cv2.putText(panel_d, "D: Candidates (hull+close)", (8, 24), **lbl)
+            cv2.putText(panel_e, "E: Canny (diag only)", (8, 24), **lbl)
+            cv2.putText(panel_f, "F: Original Undistorted", (8, 24), **lbl)
 
             top_row    = np.hstack([panel_a, panel_b, panel_c])
             bottom_row = np.hstack([panel_d, panel_e, panel_f])
