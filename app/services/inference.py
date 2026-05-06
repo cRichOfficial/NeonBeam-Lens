@@ -14,45 +14,23 @@ logger = logging.getLogger("vision_api.inference")
 # ──────────────────────────────────────────────────────────────────────────────
 
 class InferenceService:
-    """
-    Simple, robust OpenCV workpiece detector for a honeycomb laser bed.
-
-    The detection strategy is intentionally minimal:
-
-      ① CLAHE-enhanced grayscale + Gaussian blur  (preprocessing)
-      ② Thresholding to isolate the workpiece from the dark bed
-            • Primary:  background subtraction diff vs empty-bed reference
-            • Fallback: Otsu global threshold (no reference needed)
-      ③ Convex-hull fill of each candidate blob
-            Converts a partial / noisy blob into a solid convex shape,
-            which naturally completes a workpiece seen at 60-80% coverage.
-      ④ Morphological close to smooth hull edges
-      ⑤ Contour area filter (min/max mm²)
-      ⑥ minAreaRect → rotated bounding box + rotation angle
-      ⑦ Homography map from pixels → physical mm coordinates
-
-    Debug panels (calibration_data/detect_debug.jpg):
-      A  RAW frame + final detection overlays
-      B  CLAHE-enhanced input (what the algorithm sees)
-      C  Threshold/diff mask — raw pixels before morphology (magenta)
-      D  Candidate mask — after hull fill + close (yellow)  ← shape used for detection
-      E  Canny edges — diagnostic only, not used for detection (cyan)
-    """
-
     _REFERENCE_PATH = "calibration_data/reference_frame.jpg"
 
     def __init__(self):
         self.min_area_mm2       = float(os.getenv("MIN_WORKPIECE_AREA_MM2",   "500"))
         self.max_area_mm2       = float(os.getenv("MAX_WORKPIECE_AREA_MM2",   "160000"))
-        self.honeycomb_kernel   = int(os.getenv("HONEYCOMB_KERNEL_SIZE",      "25"))
+        self.grouping_reach     = int(os.getenv("DETECT_GROUPING_REACH_PX",   "25"))
         self.apriltag_mask_pad  = int(os.getenv("APRILTAG_MASK_PADDING",      "30"))
-        self.diff_threshold     = int(os.getenv("DETECT_DIFF_THRESHOLD",      "25"))
+        self.change_threshold   = int(os.getenv("DETECT_CHANGE_THRESHOLD",    "25"))
+        self.canny_high         = int(os.getenv("DETECT_CANNY_HIGH",          "60"))
+        self.max_dim            = int(os.getenv("DETECT_MAX_DIM",             "1280"))
+        
         # Cached reference frame (lazy-loaded at working resolution)
         self._ref_gray_proc: np.ndarray | None = None
-        self._ref_sat_proc:  np.ndarray | None = None   # HSV saturation channel
+        self._ref_sat_proc:  np.ndarray | None = None
         self._ref_proc_size: tuple[int, int] | None = None
         self.initialized = True
-        logger.info("InferenceService initialised (threshold + hull-fill pipeline).")
+        logger.info("InferenceService initialised (modular pipeline).")
 
     # ── Reference Frame ────────────────────────────────────────────────────────
 
@@ -79,24 +57,19 @@ class InferenceService:
         self._ref_proc_size = None
 
     def _load_ref_channels(self, proc_w: int, proc_h: int) -> tuple:
-        """Lazily load raw grayscale and HSV-saturation channels of the reference frame.
-
-        Returns (gray, saturation) tuple — either may be None if unavailable.
-        Both channels are cached at the requested working resolution.
-        """
+        """Lazily load raw grayscale and HSV-saturation channels of the reference frame."""
         if not self.has_reference:
             return None, None
         if self._ref_gray_proc is not None and self._ref_proc_size == (proc_w, proc_h):
             return self._ref_gray_proc, self._ref_sat_proc
+            
         raw = cv2.imread(self._REFERENCE_PATH)
         if raw is None:
             logger.warning("Reference frame unreadable.")
             return None, None
+            
         resized = cv2.resize(raw, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
-        # RAW grayscale — no CLAHE (content-adaptive normalisation would make
-        # dark grain look unchanged relative to a workpiece-covered live frame).
         self._ref_gray_proc = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-        # HSV saturation — used for the colour-hint diff.
         self._ref_sat_proc  = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)[:, :, 1]
         self._ref_proc_size = (proc_w, proc_h)
         logger.debug(f"Reference loaded at {proc_w}x{proc_h} (gray + saturation).")
@@ -110,304 +83,148 @@ class InferenceService:
         n = max(3, int(n))
         return n if n % 2 == 1 else n + 1
 
-    # ── Detection Core ─────────────────────────────────────────────────────────
+    # ── Pipeline Steps ─────────────────────────────────────────────────────────
 
-    def _detect_objects(
-        self, image: np.ndarray
-    ) -> Tuple[List[Dict], np.ndarray, np.ndarray, np.ndarray, int, int]:
-        """
-        Run the detection pipeline on an already-undistorted frame.
-
-        Returns:
-            (results, raw_thresh_mask, candidate_mask, canny_diag, proc_w, proc_h)
-        """
+    def _get_working_resolution(self, image: np.ndarray) -> Tuple[np.ndarray, float, int, int]:
         orig_h, orig_w = image.shape[:2]
-        t0 = time.monotonic()
-
-        # ── 1. Working resolution ─────────────────────────────────────────────
-        max_dim  = int(os.getenv("DETECT_MAX_DIM", "1280"))
         long_side = max(orig_h, orig_w)
-        if long_side > max_dim:
-            ds     = max_dim / long_side
+        if long_side > self.max_dim:
+            ds = self.max_dim / long_side
             proc_w = int(orig_w * ds)
             proc_h = int(orig_h * ds)
-            proc   = cv2.resize(image, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
+            proc = cv2.resize(image, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
         else:
-            ds     = 1.0
+            ds = 1.0
             proc_w, proc_h = orig_w, orig_h
-            proc   = image
+            proc = image
+        return proc, ds, proc_w, proc_h
 
-        logger.debug(f"Working res: {proc_w}×{proc_h}  ds={ds:.3f}")
-
-        # ── 2. Preprocess ─────────────────────────────────────────────────────
-        ref_dim  = 720.0
-        scale    = min(proc_h, proc_w) / ref_dim
-        smooth_k = self._odd(11 * scale)
-        morph_k  = self._odd(self.honeycomb_kernel * scale)
-        tag_pad  = int(self.apriltag_mask_pad * scale)
-        min_area = max(100, int(1000 * scale * scale))
-
-        gray     = cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY)
-        clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        blurred  = cv2.GaussianBlur(enhanced, (smooth_k, smooth_k), 0)
-
-        # ── 3. ROI mask from AprilTag convex hull ─────────────────────────────
+    def _compute_roi_mask(self, image: np.ndarray, ds: float, proc_w: int, proc_h: int, scale: float) -> np.ndarray:
         from .calibration import calibration_service
         tags_full = calibration_service.detect_tags(image, apply_undistort=False)
         tags_proc = [
             {**t, 'corners': (np.array(t['corners'], dtype=np.float32) * ds).tolist()}
             for t in tags_full
         ]
-        logger.debug(f"AprilTags: {len(tags_proc)}")
-
+        
         mask_roi = np.zeros((proc_h, proc_w), dtype=np.uint8)
         if len(tags_proc) >= 3:
-            pts  = np.vstack([np.array(t['corners'], dtype=np.int32) for t in tags_proc])
+            pts = np.vstack([np.array(t['corners'], dtype=np.int32) for t in tags_proc])
             hull = cv2.convexHull(pts)
             cv2.fillPoly(mask_roi, [hull], 255)
         else:
             margin = int(80 * scale)
             mask_roi[margin:-margin, margin:-margin] = 255
-            logger.warning(f"Only {len(tags_proc)} tags — using margin ROI.")
 
-        # Erase tag squares (including white paper backing)
+        tag_pad = int(self.apriltag_mask_pad * scale)
         for tag in tags_proc:
-            corners  = np.array(tag['corners'], dtype=np.float32)
+            corners = np.array(tag['corners'], dtype=np.float32)
             centroid = corners.mean(axis=0)
-            diag     = np.linalg.norm(corners - centroid, axis=1).max()
-            scale_f  = 1.0 + tag_pad / max(diag, 1.0)
+            diag = np.linalg.norm(corners - centroid, axis=1).max()
+            scale_f = 1.0 + tag_pad / max(diag, 1.0)
             expanded = centroid + (corners - centroid) * scale_f
             cv2.fillPoly(mask_roi, [expanded.astype(np.int32)], 0)
 
-        # Erode ROI slightly to avoid boundary artefacts
         if tag_pad > 0:
-            erode_se = cv2.getStructuringElement(
-                cv2.MORPH_RECT, (tag_pad * 2 + 1, tag_pad * 2 + 1)
-            )
+            erode_se = cv2.getStructuringElement(cv2.MORPH_RECT, (tag_pad * 2 + 1, tag_pad * 2 + 1))
             mask_roi = cv2.erode(mask_roi, erode_se, iterations=1)
+            
+        return mask_roi
 
-        # ── 4. Threshold mask ─────────────────────────────────────────────────
-        #
-        #  PRIMARY — background subtraction diff:
-        #    Works for ANY material (bright or dark) because it detects CHANGE,
-        #    not absolute brightness.  Requires a reference frame captured with
-        #    the bed empty (saved automatically during Mapping calibration).
-        #
-        #  FALLBACK — Otsu global threshold:
-        #    The honeycomb bed is predominantly dark.  Most workpieces are
-        #    lighter than the bed, so Otsu cleanly separates them.
-        #    Works without a reference frame but misses dark materials.
+    def _compute_brightness_diff(self, proc_gray: np.ndarray, ref_gray: np.ndarray, smooth_k: int) -> np.ndarray:
+        gray_blurred = cv2.GaussianBlur(proc_gray, (smooth_k, smooth_k), 0)
+        ref_blurred  = cv2.GaussianBlur(ref_gray, (smooth_k, smooth_k), 0)
+        return cv2.absdiff(gray_blurred, ref_blurred)
 
-        ref_gray, ref_sat = self._load_ref_channels(proc_w, proc_h)
+    def _compute_saturation_diff(self, proc_hsv: np.ndarray, ref_sat: np.ndarray, smooth_k: int) -> np.ndarray:
+        sat_live = proc_hsv[:, :, 1]
+        sat_live_blur = cv2.GaussianBlur(sat_live, (smooth_k, smooth_k), 0)
+        ref_sat_blur  = cv2.GaussianBlur(ref_sat, (smooth_k, smooth_k), 0)
+        # Only positive saturation gain (0-255 clamped)
+        return np.clip(
+            sat_live_blur.astype(np.int16) - ref_sat_blur.astype(np.int16),
+            0, 255
+        ).astype(np.uint8)
 
-        if ref_gray is not None:
-            # Diff on RAW blurred grayscale — NOT the CLAHE-enhanced image.
-            # ref_gray is raw (no CLAHE); we blur both sides equally to suppress
-            # per-pixel camera noise before thresholding the change magnitude.
-            gray_blurred = cv2.GaussianBlur(gray, (smooth_k, smooth_k), 0)
-            ref_blurred  = cv2.GaussianBlur(ref_gray, (smooth_k, smooth_k), 0)
-            abs_diff     = cv2.absdiff(gray_blurred, ref_blurred)
-            _, raw_mask  = cv2.threshold(
-                abs_diff, self.diff_threshold, 255, cv2.THRESH_BINARY
-            )
-            strategy = "diff"
-            logger.debug(
-                f"Diff mask (raw gray): threshold={self.diff_threshold}  "
-                f"px={cv2.countNonZero(raw_mask)}"
-            )
-        else:
-            # Otsu on the ROI pixels only
-            roi_pixels = blurred[mask_roi > 0]
-            if len(roi_pixels) > 0:
-                otsu_t, _ = cv2.threshold(
-                    roi_pixels, 0, 255,
-                    cv2.THRESH_BINARY | cv2.THRESH_OTSU
-                )
-            else:
-                otsu_t = 127
-            _, raw_mask = cv2.threshold(blurred, otsu_t, 255, cv2.THRESH_BINARY)
-            strategy = f"otsu@{otsu_t:.0f}"
-            logger.debug(f"Otsu mask: threshold={otsu_t:.0f}")
+    def _compute_combined_score(self, b_diff: np.ndarray, s_diff: np.ndarray) -> np.ndarray:
+        # Simple addition clamped to 255
+        return cv2.add(b_diff, s_diff)
 
-        # Restrict to ROI
-        raw_mask = cv2.bitwise_and(raw_mask, raw_mask, mask=mask_roi)
+    def _apply_threshold(self, combined_score: np.ndarray, threshold: int) -> np.ndarray:
+        _, mask = cv2.threshold(combined_score, threshold, 255, cv2.THRESH_BINARY)
+        return mask
 
-        # ── 4b. HSV saturation hint mask ──────────────────────────────────────
-        #
-        #  Coloured workpieces (e.g. anodized aluminum) can have large brightness
-        #  variation across a reflective surface, causing the brightness diff mask
-        #  to split them into disconnected fragments.  The saturation hint closes
-        #  those gaps.
-        #
-        #  STRATEGY — saturation diff (preferred, requires reference frame):
-        #    Compute abs(sat_live - sat_ref) per pixel, the same way the brightness
-        #    diff works.  Only pixels that became MORE saturated since the empty-bed
-        #    reference was captured are flagged.  The achromatic honeycomb bed stays
-        #    near zero; a vivid coloured workpiece lights up across its full area.
-        #
-        #  FALLBACK — absolute saturation (no reference frame):
-        #    The threshold is forced to >= 80 to avoid false-positives from the
-        #    warm-toned metal bed.
-        #
-        #  DETECT_SAT_THRESHOLD (0–255, default 30):
-        #    The saturation *change* (or absolute value in fallback mode) above
-        #    which a pixel is treated as coloured foreground.  Set to 0 to disable.
-        sat_threshold = int(os.getenv("DETECT_SAT_THRESHOLD", "30"))
-        if sat_threshold > 0:
-            hsv          = cv2.cvtColor(proc, cv2.COLOR_BGR2HSV)
-            sat_live     = hsv[:, :, 1]
-            sat_live_blur = cv2.GaussianBlur(sat_live, (smooth_k, smooth_k), 0)
+    def _apply_noise_filter(self, mask: np.ndarray, min_px: int = 15) -> np.ndarray:
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        clean = np.zeros_like(mask)
+        for c in cnts:
+            if cv2.contourArea(c) >= min_px:
+                cv2.drawContours(clean, [c], -1, 255, -1)
+        return clean
 
-            if ref_sat is not None:
-                ref_sat_blur = cv2.GaussianBlur(ref_sat, (smooth_k, smooth_k), 0)
-                # Only flag pixels that gained saturation vs. the empty bed.
-                sat_gained   = np.clip(
-                    sat_live_blur.astype(np.int16) - ref_sat_blur.astype(np.int16),
-                    0, 255
-                ).astype(np.uint8)
-                _, sat_mask  = cv2.threshold(sat_gained, sat_threshold, 255, cv2.THRESH_BINARY)
-                sat_strategy = f"sat-diff>{sat_threshold}"
-            else:
-                # No reference — require high absolute saturation to avoid bed noise.
-                abs_sat_t = max(sat_threshold, 80)
-                _, sat_mask = cv2.threshold(sat_live_blur, abs_sat_t, 255, cv2.THRESH_BINARY)
-                sat_strategy = f"sat-abs>{abs_sat_t}"
-
-            sat_mask  = cv2.bitwise_and(sat_mask, sat_mask, mask=mask_roi)
-            px_before = cv2.countNonZero(raw_mask)
-            raw_mask  = cv2.bitwise_or(raw_mask, sat_mask)
-            logger.debug(
-                f"Sat-hint ({sat_strategy}): "
-                f"added {cv2.countNonZero(raw_mask) - px_before} px"
-            )
-
-        # ── 5. Grouped convex hull (Object-aware) ─────────────────────────────
-        #
-        #  Wood grain / uneven lighting splits a single workpiece into several
-        #  disconnected blobs.  To fix this, we "group" blobs that are close
-        #  to each other by dilating the mask, finding connected groups,
-        #  and then taking the convex hull of only the fragments within each group.
-        #
-        #  This bridges the grain gaps within a single piece without merging
-        #  separate workpieces that are far apart.
-
-        # 5a. Filter raw_mask to remove tiny noise specks before grouping.
-        # If a 1-pixel noise speck is near an object, the dilation will group it,
-        # and the convex hull will stretch out to include it, bloating the box.
-        r_cnts, _ = cv2.findContours(raw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        clean_raw = np.zeros_like(raw_mask)
-        for c in r_cnts:
-            if cv2.contourArea(c) >= 15:
-                cv2.drawContours(clean_raw, [c], -1, 255, -1)
-        raw_mask = clean_raw
-
-        # 5a. Create grouping mask by dilating (bridges gaps up to morph_k px)
+    def _group_and_fill_hulls(self, clean_mask: np.ndarray, morph_k: int, min_area: float) -> np.ndarray:
         group_se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_k, morph_k))
-        group_mask = cv2.dilate(raw_mask, group_se)
-
-        # 5b. Find groups (potential separate objects)
-        group_cnts, _ = cv2.findContours(
-            group_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        hull_mask = np.zeros((proc_h, proc_w), dtype=np.uint8)
+        group_mask = cv2.dilate(clean_mask, group_se)
+        
+        group_cnts, _ = cv2.findContours(group_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        hull_mask = np.zeros_like(clean_mask)
+        
         for g_cnt in group_cnts:
-            # Cheap area filter to ignore tiny noise groups
             if cv2.contourArea(g_cnt) < max(min_area * 0.05, 50):
                 continue
-
-            # Create a mask for this specific group to isolate its fragments
-            temp_g_mask = np.zeros((proc_h, proc_w), dtype=np.uint8)
+                
+            temp_g_mask = np.zeros_like(clean_mask)
             cv2.drawContours(temp_g_mask, [g_cnt], -1, 255, -1)
-
-            # Find all original threshold points that fall inside this group
-            object_pts_mask = cv2.bitwise_and(raw_mask, temp_g_mask)
+            
+            object_pts_mask = cv2.bitwise_and(clean_mask, temp_g_mask)
             pts = np.argwhere(object_pts_mask > 0)
-
+            
             if len(pts) > 5:
-                # np.argwhere returns [y, x], cv2 expects [x, y]
                 pts_xy = pts[:, [1, 0]].astype(np.int32)
                 hull = cv2.convexHull(pts_xy)
                 cv2.fillPoly(hull_mask, [hull], 255)
+                
+        return hull_mask
 
-        # ── 6. Edge-pad dilation + morphological close ────────────────────────
-        #
-        #  The combined hull may still fall short of the real workpiece boundary
-        #  if the threshold missed a dark-grained ring around the edges.
-        #  DETECT_EDGE_PAD_PX (default = morph_k) expands the hull outward to
-        #  cover those missed edge pixels before the final close.
-        edge_pad = int(os.getenv("DETECT_EDGE_PAD_PX", "0"))
-        if edge_pad > 0:
-            pad_se   = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (self._odd(edge_pad), self._odd(edge_pad))
-            )
-            hull_mask = cv2.dilate(hull_mask, pad_se, iterations=1)
-
-        close_k  = self._odd(morph_k * 2)
-        close_se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+    def _smooth_candidates(self, hull_mask: np.ndarray, mask_roi: np.ndarray) -> np.ndarray:
+        # Decoupled small fixed kernel for closing (e.g. 5x5) to prevent boundary inflation
+        close_se = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         candidate_mask = cv2.morphologyEx(hull_mask, cv2.MORPH_CLOSE, close_se)
+        return cv2.bitwise_and(candidate_mask, candidate_mask, mask=mask_roi)
 
-        # Restrict to ROI
-        candidate_mask = cv2.bitwise_and(candidate_mask, candidate_mask, mask=mask_roi)
-
-        # ── 7. Canny — diagnostic only ────────────────────────────────────────
-        canny_h = float(os.getenv("DETECT_CANNY_HIGH", "60"))
-        canny_diag = cv2.Canny(blurred, canny_h * 0.2, canny_h)
-        canny_diag = cv2.bitwise_and(canny_diag, canny_diag, mask=mask_roi)
-
-        # ── 8. Final contours from candidate mask ─────────────────────────────
-        final_cnts, _ = cv2.findContours(
-            candidate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        logger.debug(f"Candidate contours: {len(final_cnts)}  strategy={strategy}")
-
-        # ── 9. Build results ───────────────────────────────────────────────────
-        results: List[Dict] = []
+    def _extract_results(self, candidate_mask: np.ndarray, ds: float, proc_w: int, proc_h: int, min_area: float) -> List[Dict]:
+        final_cnts, _ = cv2.findContours(candidate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        results = []
         from .calibration import calibration_service as cal
 
         for i, cnt in enumerate(final_cnts):
-            # Pixel-space area filter (cheap, pre-mm)
             if cv2.contourArea(cnt) < min_area:
                 continue
             if cv2.contourArea(cnt) > proc_w * proc_h * 0.5:
                 continue
 
-            # Scale back to full-res pixel coordinates
             cnt_full = (cnt.astype(np.float64) / ds).astype(np.int32) if ds < 1.0 else cnt
 
-            # Rotated bounding box
-            rect       = cv2.minAreaRect(cnt_full)
+            rect = cv2.minAreaRect(cnt_full)
             corners_px = cv2.boxPoints(rect).astype(np.float32)
 
-            # Rotation angle: pick the longest edge, compute with atan2.
-            # This is version-agnostic (minAreaRect angle conventions differ
-            # between OpenCV versions) and normalises to [-45, 45].
-            edges    = [corners_px[1] - corners_px[0], corners_px[2] - corners_px[1]]
-            long_e   = max(edges, key=lambda e: float(e[0]**2 + e[1]**2))
+            edges = [corners_px[1] - corners_px[0], corners_px[2] - corners_px[1]]
+            long_e = max(edges, key=lambda e: float(e[0]**2 + e[1]**2))
             angle_deg = math.degrees(math.atan2(float(long_e[1]), float(long_e[0])))
-            while angle_deg >  45.0: angle_deg -= 90.0
+            while angle_deg > 45.0: angle_deg -= 90.0
             while angle_deg < -45.0: angle_deg += 90.0
 
             corners_px = corners_px.astype(np.int32)
-
-            # Convex hull of full-res contour for segmentation polygon
             hull_full = cv2.convexHull(cnt_full)
-            seg_px    = hull_full.reshape(-1, 2).tolist()
+            seg_px = hull_full.reshape(-1, 2).tolist()
             x, y, w, h = cv2.boundingRect(cnt_full)
 
-            # Map to physical mm via homography
             corners_mm = cal.map_pixels_to_mm(corners_px.astype(np.float32))
-            seg_mm     = cal.map_pixels_to_mm(np.array(seg_px, dtype=np.float32))
+            seg_mm = cal.map_pixels_to_mm(np.array(seg_px, dtype=np.float32))
 
-            area_mm2 = float(
-                cv2.contourArea(corners_mm.reshape(-1, 1, 2).astype(np.float32))
-            )
+            area_mm2 = float(cv2.contourArea(corners_mm.reshape(-1, 1, 2).astype(np.float32)))
+            
             if not (self.min_area_mm2 <= area_mm2 <= self.max_area_mm2):
-                logger.debug(
-                    f"Filtered {i}: area={area_mm2:.0f} mm²  "
-                    f"range=[{self.min_area_mm2}, {self.max_area_mm2}]"
-                )
                 continue
 
             box_mm = [
@@ -430,166 +247,144 @@ class InferenceService:
                 "box_mm":           box_mm,
                 "area_mm2":         round(area_mm2, 1),
             })
+            
+        return results
+
+    # ── Core Detect ────────────────────────────────────────────────────────────
+
+    def _detect_objects(self, image: np.ndarray):
+        t0 = time.monotonic()
+        
+        # 1. Working Resolution
+        proc_image, ds, proc_w, proc_h = self._get_working_resolution(image)
+        scale = min(proc_h, proc_w) / 720.0
+        smooth_k = self._odd(11 * scale)
+        morph_k  = self._odd(self.grouping_reach * scale)
+        min_area = max(100, int(1000 * scale * scale))
+
+        # 2. ROI Mask
+        mask_roi = self._compute_roi_mask(image, ds, proc_w, proc_h, scale)
+        
+        proc_gray = cv2.cvtColor(proc_image, cv2.COLOR_BGR2GRAY)
+        proc_hsv  = cv2.cvtColor(proc_image, cv2.COLOR_BGR2HSV)
+        
+        ref_gray, ref_sat = self._load_ref_channels(proc_w, proc_h)
+
+        b_diff = np.zeros((proc_h, proc_w), dtype=np.uint8)
+        s_diff = np.zeros((proc_h, proc_w), dtype=np.uint8)
+        combined_score = np.zeros((proc_h, proc_w), dtype=np.uint8)
+
+        if ref_gray is not None:
+            # Subtraction path
+            b_diff = self._compute_brightness_diff(proc_gray, ref_gray, smooth_k)
+            s_diff = self._compute_saturation_diff(proc_hsv, ref_sat, smooth_k)
+            combined_score = self._compute_combined_score(b_diff, s_diff)
+            raw_mask = self._apply_threshold(combined_score, self.change_threshold)
+        else:
+            # Otsu fallback (no reference)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(proc_gray)
+            blurred = cv2.GaussianBlur(enhanced, (smooth_k, smooth_k), 0)
+            roi_pixels = blurred[mask_roi > 0]
+            otsu_t = cv2.threshold(roi_pixels, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[0] if len(roi_pixels) > 0 else 127
+            raw_mask = cv2.threshold(blurred, otsu_t, 255, cv2.THRESH_BINARY)[1]
+
+        raw_mask = cv2.bitwise_and(raw_mask, raw_mask, mask=mask_roi)
+
+        # Pipeline Steps
+        clean_mask     = self._apply_noise_filter(raw_mask)
+        hull_mask      = self._group_and_fill_hulls(clean_mask, morph_k, min_area)
+        candidate_mask = self._smooth_candidates(hull_mask, mask_roi)
+        results        = self._extract_results(candidate_mask, ds, proc_w, proc_h, min_area)
 
         elapsed = time.monotonic() - t0
         logger.info(f"Detection: {len(results)} workpiece(s) in {elapsed:.3f}s")
-        return results, raw_mask, candidate_mask, canny_diag, proc_w, proc_h
+        
+        # Return all step outputs for the debug image generator
+        return results, b_diff, s_diff, combined_score, raw_mask, clean_mask, hull_mask, candidate_mask
 
     # ── Debug Composite ────────────────────────────────────────────────────────
 
-    def _save_debug_image(
-        self,
-        image: np.ndarray,
-        results: List[Dict],
-        mean_brightness: float,
-        raw_mask: np.ndarray | None,
-        candidate_mask: np.ndarray | None,
-        canny_diag: np.ndarray | None,
-        proc_w: int,
-        proc_h: int,
-    ) -> None:
+    def _save_debug_image(self, image: np.ndarray, results: List[Dict], steps_data: tuple) -> None:
         """
-        Write a 5-panel 3+2 grid to calibration_data/detect_debug.jpg:
-
-          [A] Raw frame + overlays  [B] CLAHE input  [C] Threshold/diff mask
-          [D] Candidate mask (after hull fill + close)  [E] Canny (diag only)
+        Write a 3x3 9-panel grid to calibration_data/detect_debug.jpg:
+          [A] Original       [B] Brightness Diff   [C] Saturation Diff
+          [D] Combined       [E] Binary Threshold  [F] Noise Filtered
+          [G] Hull Grouping  [H] Morphological     [I] Final Detections
         """
+        b_diff, s_diff, combined_score, raw_mask, clean_mask, hull_mask, candidate_mask = steps_data
+        
         debug_path = "calibration_data/detect_debug.jpg"
         os.makedirs(os.path.dirname(debug_path), exist_ok=True)
 
-        overlay = image.copy()
-        for wp in results:
-            pts     = np.array(wp['corners_px'], dtype=np.int32)
-            cx      = int(pts[:, 0].mean())
-            cy      = int(pts[:, 1].mean())
-            angle_r = math.radians(wp.get('angle_deg', 0))
-            ax      = int(cx + 50 * math.cos(angle_r))
-            ay      = int(cy + 50 * math.sin(angle_r))
-
-            cv2.polylines(overlay, [pts], True, (0, 220, 0), 2)
-            cv2.arrowedLine(overlay, (cx, cy), (ax, ay), (0, 140, 255), 2, tipLength=0.25)
-
-            def _text(img, txt, pos, scale, fg, thickness):
-                """Draw outlined text: thick black stroke then bright colour on top."""
-                cv2.putText(img, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
-                            scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
-                cv2.putText(img, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
-                            scale, fg,       thickness,     cv2.LINE_AA)
-
-            _text(overlay,
-                  f"{wp['id']}  {wp.get('angle_deg', 0):.1f}\u00b0  {wp.get('area_mm2', 0):.0f}mm\u00b2",
-                  (pts[0][0], pts[0][1] - 12),
-                  0.55, (0, 255, 60), 2)
-
-            for px, mm in zip(pts, wp['corners_mm']):
-                _text(overlay,
-                      f"({int(mm[0])},{int(mm[1])})",
-                      (int(px[0]), int(px[1])),
-                      0.6, (255, 255, 255), 2)
-
         try:
             MAX_W = 1280
-            h, w  = overlay.shape[:2]
-            s     = min(1.0, MAX_W / w)
-            tw, th = int(w * s), int(h * s)
+            orig_h, orig_w = image.shape[:2]
+            s = min(1.0, MAX_W / orig_w)
+            tw, th = int(orig_w * s), int(orig_h * s)
 
-            # Panel A — clean undistorted image (no overlays)
-            panel_a = cv2.resize(image, (tw, th))
+            def _resize(img): return cv2.resize(img, (tw, th))
+            def _to_bgr(mask): return cv2.cvtColor(_resize(mask), cv2.COLOR_GRAY2BGR)
 
-            # Panel B — RAW frame with detection overlays
-            panel_b = cv2.resize(overlay, (tw, th))
+            # Panel A: Original Undistorted
+            panel_a = _resize(image)
 
-            # CLAHE base — reused as the background for panels C–F
-            gray_c   = cv2.cvtColor(cv2.resize(image, (tw, th)), cv2.COLOR_BGR2GRAY)
-            clahe_c  = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray_c)
-            base_bgr = cv2.cvtColor(clahe_c, cv2.COLOR_GRAY2BGR)
-            panel_c  = base_bgr.copy()
+            # Panel B: Brightness Diff (HOT)
+            panel_b = cv2.applyColorMap(_resize(b_diff), cv2.COLORMAP_HOT)
 
-            def _overlay(mask: np.ndarray | None, color_bgr: tuple,
-                         alpha: float = 0.55) -> np.ndarray:
-                """
-                Blend a coloured mask on top of the CLAHE base image.
-                Masked pixels = (1-alpha)*base + alpha*colour.
-                Unmasked pixels = base (the scene is fully visible).
-                """
-                out = base_bgr.copy()
-                if mask is None or mask.size == 0:
-                    return out
-                m = cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST)
-                color_layer = np.full((th, tw, 3), color_bgr, dtype=np.uint8)
-                where = m > 128
-                out[where] = cv2.addWeighted(
-                    base_bgr, 1 - alpha, color_layer, alpha, 0
-                )[where]
-                return out
+            # Panel C: Saturation Diff (COOL)
+            panel_c = cv2.applyColorMap(_resize(s_diff), cv2.COLORMAP_COOL)
 
-            panel_d = _overlay(raw_mask,      (255,  50, 180))   # magenta — raw threshold
-            panel_e = _overlay(candidate_mask, (0,   230, 230))   # yellow  — candidates
-            panel_f = _overlay(canny_diag,     (0,   255, 100))   # green   — canny diag
+            # Panel D: Combined Score (JET)
+            panel_d = cv2.applyColorMap(_resize(combined_score), cv2.COLORMAP_JET)
 
-            # ── Row 3: reference frame + raw diff images ──────────────────────
-            # Load the reference at display resolution and compute the pre-
-            # threshold diff arrays so the user can see what the subtraction
-            # looks like before any thresholding is applied.
-            _BLACK = np.zeros((th, tw, 3), dtype=np.uint8)
+            # Panel E: Binary Threshold
+            panel_e = _to_bgr(raw_mask)
 
-            ref_raw = cv2.imread(self._REFERENCE_PATH) if self.has_reference else None
-            if ref_raw is not None:
-                ref_display = cv2.resize(ref_raw, (tw, th), interpolation=cv2.INTER_AREA)
-                panel_g = ref_display.copy()
+            # Panel F: After Noise Filter
+            panel_f = _to_bgr(clean_mask)
 
-                # Brightness diff (abs) — HOT colormap: brighter = bigger change
-                img_small = cv2.resize(image, (tw, th))
-                igray = cv2.cvtColor(img_small,   cv2.COLOR_BGR2GRAY).astype(np.int16)
-                rgray = cv2.cvtColor(ref_display, cv2.COLOR_BGR2GRAY).astype(np.int16)
-                bdiff = np.clip(np.abs(igray - rgray), 0, 255).astype(np.uint8)
-                panel_h = cv2.applyColorMap(bdiff, cv2.COLORMAP_HOT)
+            # Panel G: After Hull Grouping
+            panel_g = _to_bgr(hull_mask)
 
-                # Saturation gained vs reference — COOL colormap: brighter = more colour
-                ihsv  = cv2.cvtColor(img_small,   cv2.COLOR_BGR2HSV)
-                rhsv  = cv2.cvtColor(ref_display, cv2.COLOR_BGR2HSV)
-                sdiff = np.clip(
-                    ihsv[:, :, 1].astype(np.int16) - rhsv[:, :, 1].astype(np.int16),
-                    0, 255,
-                ).astype(np.uint8)
-                panel_i = cv2.applyColorMap(sdiff, cv2.COLORMAP_COOL)
-            else:
-                panel_g = _BLACK.copy()
-                panel_h = _BLACK.copy()
-                panel_i = _BLACK.copy()
+            # Panel H: After Morphological Close
+            panel_h = _to_bgr(candidate_mask)
 
-            lbl = dict(fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                       fontScale=0.5, color=(0, 255, 255), thickness=2)
-            has_ref = "ref" if self.has_reference else "no-ref"
-            cv2.putText(panel_a, "A: Original Undistorted", (8, 24), **lbl)
-            cv2.putText(panel_b, f"B: RAW  mean={mean_brightness:.0f}", (8, 24), **lbl)
-            cv2.putText(panel_c, "C: CLAHE input", (8, 24), **lbl)
-            cv2.putText(panel_d, f"D: Threshold ({has_ref})", (8, 24), **lbl)
-            cv2.putText(panel_e, "E: Candidates (hull+close)", (8, 24), **lbl)
-            cv2.putText(panel_f, "F: Canny (diag only)", (8, 24), **lbl)
-            cv2.putText(panel_g, "G: Reference frame", (8, 24), **lbl)
-            cv2.putText(panel_h, "H: Brightness diff (pre-threshold)", (8, 24), **lbl)
-            cv2.putText(panel_i, "I: Saturation diff (pre-threshold)", (8, 24), **lbl)
+            # Panel I: Final Detections (Original + Overlays)
+            overlay = panel_a.copy()
+            for wp in results:
+                pts = (np.array(wp['corners_px'], dtype=np.float32) * s).astype(np.int32)
+                cx, cy = int(pts[:, 0].mean()), int(pts[:, 1].mean())
+                angle_r = math.radians(wp.get('angle_deg', 0))
+                ax = int(cx + 40 * math.cos(angle_r))
+                ay = int(cy + 40 * math.sin(angle_r))
 
-            top_row    = np.hstack([panel_a, panel_b, panel_c])
-            mid_row    = np.hstack([panel_d, panel_e, panel_f])
-            bottom_row = np.hstack([panel_g, panel_h, panel_i])
-            cv2.imwrite(debug_path, np.vstack([top_row, mid_row, bottom_row]))
+                cv2.polylines(overlay, [pts], True, (0, 220, 0), 2)
+                cv2.arrowedLine(overlay, (cx, cy), (ax, ay), (0, 140, 255), 2, tipLength=0.25)
+            panel_i = overlay
+
+            lbl_args = dict(fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.5, color=(0, 255, 255), thickness=2)
+            cv2.putText(panel_a, "A: Original", (8, 24), **lbl_args)
+            cv2.putText(panel_b, "B: Brightness Diff", (8, 24), **lbl_args)
+            cv2.putText(panel_c, "C: Saturation Diff", (8, 24), **lbl_args)
+            cv2.putText(panel_d, "D: Combined Score", (8, 24), **lbl_args)
+            cv2.putText(panel_e, "E: Binary Threshold", (8, 24), **lbl_args)
+            cv2.putText(panel_f, "F: Noise Filtered", (8, 24), **lbl_args)
+            cv2.putText(panel_g, "G: Hull Grouping", (8, 24), **lbl_args)
+            cv2.putText(panel_h, "H: Morphological", (8, 24), **lbl_args)
+            cv2.putText(panel_i, "I: Final Detections", (8, 24), **lbl_args)
+
+            row1 = np.hstack([panel_a, panel_b, panel_c])
+            row2 = np.hstack([panel_d, panel_e, panel_f])
+            row3 = np.hstack([panel_g, panel_h, panel_i])
+            cv2.imwrite(debug_path, np.vstack([row1, row2, row3]))
+
         except Exception as exc:
             logger.warning(f"Debug composite failed: {exc}")
-            cv2.imwrite(debug_path, overlay)
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def detect_workpieces(self, image: np.ndarray) -> List[Dict]:
-        """
-        Detect workpieces in a camera frame.
-
-        Returns a list of dicts containing:
-            id, class, confidence, angle_deg,
-            box_px, corners_px, segmentation_px,
-            corners_mm, segmentation_mm, box_mm, area_mm2
-        """
         if image is None:
             return []
 
@@ -598,18 +393,11 @@ class InferenceService:
 
         mean_brightness = float(np.mean(image))
         if mean_brightness < 15:
-            logger.warning(
-                f"Frame very dark (mean={mean_brightness:.1f}) — "
-                "AE may still be settling."
-            )
+            logger.warning(f"Frame very dark (mean={mean_brightness:.1f}) — AE may still be settling.")
 
-        results, raw_mask, candidate_mask, canny_diag, pw, ph = \
-            self._detect_objects(image)
-
-        self._save_debug_image(
-            image, results, mean_brightness,
-            raw_mask, candidate_mask, canny_diag, pw, ph,
-        )
+        results, *steps_data = self._detect_objects(image)
+        self._save_debug_image(image, results, steps_data)
+        
         return results
 
 
