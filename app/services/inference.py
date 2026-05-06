@@ -353,6 +353,16 @@ class InferenceService:
 
             # Panel I: Final Detections (Original + Overlays)
             overlay = panel_a.copy()
+            
+            # Draw semi-transparent segmentation hulls first
+            seg_overlay = overlay.copy()
+            for wp in results:
+                seg_pts = (np.array(wp['segmentation_px'], dtype=np.float32) * s).astype(np.int32)
+                cv2.fillPoly(seg_overlay, [seg_pts], (255, 100, 0)) # Blueish translucent fill
+            
+            cv2.addWeighted(seg_overlay, 0.4, overlay, 0.6, 0, overlay)
+
+            # Draw bounding boxes, arrows, and text on top
             for wp in results:
                 pts = (np.array(wp['corners_px'], dtype=np.float32) * s).astype(np.int32)
                 cx, cy = int(pts[:, 0].mean()), int(pts[:, 1].mean())
