@@ -292,6 +292,16 @@ class InferenceService:
         #  This bridges the grain gaps within a single piece without merging
         #  separate workpieces that are far apart.
 
+        # 5a. Filter raw_mask to remove tiny noise specks before grouping.
+        # If a 1-pixel noise speck is near an object, the dilation will group it,
+        # and the convex hull will stretch out to include it, bloating the box.
+        r_cnts, _ = cv2.findContours(raw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        clean_raw = np.zeros_like(raw_mask)
+        for c in r_cnts:
+            if cv2.contourArea(c) >= 15:
+                cv2.drawContours(clean_raw, [c], -1, 255, -1)
+        raw_mask = clean_raw
+
         # 5a. Create grouping mask by dilating (bridges gaps up to morph_k px)
         group_se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_k, morph_k))
         group_mask = cv2.dilate(raw_mask, group_se)
