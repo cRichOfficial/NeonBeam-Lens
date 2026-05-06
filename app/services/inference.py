@@ -112,7 +112,7 @@ class InferenceService:
         Run the detection pipeline on an already-undistorted frame.
 
         Returns:
-            (results, raw_thresh_mask, candidate_mask, canny_diag, proc_w, proc_h, tags_full)
+            (results, raw_thresh_mask, candidate_mask, canny_diag, proc_w, proc_h)
         """
         orig_h, orig_w = image.shape[:2]
         t0 = time.monotonic()
@@ -367,7 +367,7 @@ class InferenceService:
 
         elapsed = time.monotonic() - t0
         logger.info(f"Detection: {len(results)} workpiece(s) in {elapsed:.3f}s")
-        return results, raw_mask, candidate_mask, canny_diag, proc_w, proc_h, tags_full
+        return results, raw_mask, candidate_mask, canny_diag, proc_w, proc_h
 
     # ── Debug Composite ────────────────────────────────────────────────────────
 
@@ -381,57 +381,19 @@ class InferenceService:
         canny_diag: np.ndarray | None,
         proc_w: int,
         proc_h: int,
-        tags_full: List[Dict] = None
     ) -> None:
         """
-        Write a 5-panel 3+2 grid to calibration_data/detect_debug.jpg:
+        Write a 6-panel 3x2 grid to calibration_data/detect_debug.jpg:
 
-          [A] Raw frame + overlays  [B] CLAHE input  [C] Threshold/diff mask
-          [D] Candidate mask (after hull fill + close)  [E] Canny (diag only)
+          [A] Original undistorted  [B] Overlays  [C] CLAHE input
+          [D] Threshold/diff mask   [E] Candidates (hull+close)  [F] Canny (diag only)
         """
         debug_path = "calibration_data/detect_debug.jpg"
         os.makedirs(os.path.dirname(debug_path), exist_ok=True)
 
-        x_offset, y_offset = 0, 0
-        if tags_full and len(tags_full) >= 3:
-            pts = np.vstack([np.array(t['corners'], dtype=np.int32) for t in tags_full])
-            tx, ty, tw_b, th_b = cv2.boundingRect(pts)
-            pad = 20
-            x1 = max(0, tx - pad)
-            y1 = max(0, ty - pad)
-            x2 = min(image.shape[1], tx + tw_b + pad)
-            y2 = min(image.shape[0], ty + th_b + pad)
-            
-            image = image[y1:y2, x1:x2]
-            x_offset, y_offset = x1, y1
-            
-            # Crop the masks mapped from proc resolution
-            ds_x = proc_w / float(x_offset + image.shape[1] + (x_offset == 0 and image.shape[1] or 0)) # prevent division issues
-            ds_y = proc_h / float(y_offset + image.shape[0] + (y_offset == 0 and image.shape[0] or 0))
-            # Actually, ds_x and ds_y should just be based on the original image dimensions before cropping.
-            ds_x = proc_w / float(image.shape[1] if x_offset == 0 else image.shape[1] + x2 - x1) 
-            # Re-calculating with safe original dims:
-            orig_w_full = x_offset + image.shape[1] if x_offset > 0 else image.shape[1]
-            orig_h_full = y_offset + image.shape[0] if y_offset > 0 else image.shape[0]
-            # When x_offset > 0, image was already cropped, its shape[1] is x2 - x1.
-            orig_w_full = x_offset + image.shape[1]
-            orig_h_full = y_offset + image.shape[0]
-
-            ds_x = proc_w / float(orig_w_full)
-            ds_y = proc_h / float(orig_h_full)
-            
-            mx1, my1 = int(x1 * ds_x), int(y1 * ds_y)
-            mx2, my2 = int(x2 * ds_x), int(y2 * ds_y)
-            
-            if raw_mask is not None: raw_mask = raw_mask[my1:my2, mx1:mx2]
-            if candidate_mask is not None: candidate_mask = candidate_mask[my1:my2, mx1:mx2]
-            if canny_diag is not None: canny_diag = canny_diag[my1:my2, mx1:mx2]
-
         overlay = image.copy()
         for wp in results:
             pts     = np.array(wp['corners_px'], dtype=np.int32)
-            pts[:, 0] -= x_offset
-            pts[:, 1] -= y_offset
             cx      = int(pts[:, 0].mean())
             cy      = int(pts[:, 1].mean())
             angle_r = math.radians(wp.get('angle_deg', 0))
@@ -538,12 +500,12 @@ class InferenceService:
                 "AE may still be settling."
             )
 
-        results, raw_mask, candidate_mask, canny_diag, pw, ph, tags = \
+        results, raw_mask, candidate_mask, canny_diag, pw, ph = \
             self._detect_objects(image)
 
         self._save_debug_image(
             image, results, mean_brightness,
-            raw_mask, candidate_mask, canny_diag, pw, ph, tags
+            raw_mask, candidate_mask, canny_diag, pw, ph,
         )
         return results
 
