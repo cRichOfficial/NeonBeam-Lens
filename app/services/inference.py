@@ -49,6 +49,7 @@ class InferenceService:
         self.diff_threshold     = int(os.getenv("DETECT_DIFF_THRESHOLD",      "25"))
         # Cached reference frame (lazy-loaded at working resolution)
         self._ref_gray_proc: np.ndarray | None = None
+        self._ref_sat_proc:  np.ndarray | None = None   # HSV saturation channel
         self._ref_proc_size: tuple[int, int] | None = None
         self.initialized = True
         logger.info("InferenceService initialised (threshold + hull-fill pipeline).")
@@ -64,6 +65,7 @@ class InferenceService:
         os.makedirs(os.path.dirname(self._REFERENCE_PATH), exist_ok=True)
         cv2.imwrite(self._REFERENCE_PATH, image)
         self._ref_gray_proc = None
+        self._ref_sat_proc  = None
         self._ref_proc_size = None
         logger.info(f"Reference frame saved ({image.shape[1]}x{image.shape[0]}).")
 
@@ -73,27 +75,32 @@ class InferenceService:
             os.remove(self._REFERENCE_PATH)
             logger.info("Reference frame deleted.")
         self._ref_gray_proc = None
+        self._ref_sat_proc  = None
         self._ref_proc_size = None
 
-    def _load_ref_gray(self, proc_w: int, proc_h: int) -> np.ndarray | None:
-        """Lazily load and CLAHE-enhance the reference frame at working resolution."""
+    def _load_ref_channels(self, proc_w: int, proc_h: int) -> tuple:
+        """Lazily load raw grayscale and HSV-saturation channels of the reference frame.
+
+        Returns (gray, saturation) tuple — either may be None if unavailable.
+        Both channels are cached at the requested working resolution.
+        """
         if not self.has_reference:
-            return None
+            return None, None
         if self._ref_gray_proc is not None and self._ref_proc_size == (proc_w, proc_h):
-            return self._ref_gray_proc
+            return self._ref_gray_proc, self._ref_sat_proc
         raw = cv2.imread(self._REFERENCE_PATH)
         if raw is None:
             logger.warning("Reference frame unreadable.")
-            return None
+            return None, None
         resized = cv2.resize(raw, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
-        # Store RAW grayscale — no CLAHE here.
-        # CLAHE is content-adaptive: it normalises differently when a workpiece
-        # covers the bed, making dark grain look 'unchanged' vs the empty reference.
-        # Raw pixel values reliably reflect the physical brightness change.
+        # RAW grayscale — no CLAHE (content-adaptive normalisation would make
+        # dark grain look unchanged relative to a workpiece-covered live frame).
         self._ref_gray_proc = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        # HSV saturation — used for the colour-hint diff.
+        self._ref_sat_proc  = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)[:, :, 1]
         self._ref_proc_size = (proc_w, proc_h)
-        logger.debug(f"Reference loaded at {proc_w}x{proc_h} (raw gray, no CLAHE).")
-        return self._ref_gray_proc
+        logger.debug(f"Reference loaded at {proc_w}x{proc_h} (gray + saturation).")
+        return self._ref_gray_proc, self._ref_sat_proc
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -192,7 +199,7 @@ class InferenceService:
         #    lighter than the bed, so Otsu cleanly separates them.
         #    Works without a reference frame but misses dark materials.
 
-        ref_gray = self._load_ref_gray(proc_w, proc_h)
+        ref_gray, ref_sat = self._load_ref_channels(proc_w, proc_h)
 
         if ref_gray is not None:
             # Diff on RAW blurred grayscale — NOT the CLAHE-enhanced image.
@@ -228,28 +235,50 @@ class InferenceService:
 
         # ── 4b. HSV saturation hint mask ──────────────────────────────────────
         #
-        #  The honeycomb bed is almost completely achromatic (dark gray), so any
-        #  pixel with meaningful color saturation is almost certainly a workpiece.
-        #  This is especially important for reflective / metallic colored objects
-        #  (e.g. anodized aluminum) whose brightness varies so much across the
-        #  surface that the diff mask splits them into disconnected fragments.
+        #  Coloured workpieces (e.g. anodized aluminum) can have large brightness
+        #  variation across a reflective surface, causing the brightness diff mask
+        #  to split them into disconnected fragments.  The saturation hint closes
+        #  those gaps.
         #
-        #  The hint mask is OR-combined with raw_mask BEFORE the grouping step,
-        #  ensuring a single continuous blob is seen by the convex-hull grouper.
+        #  STRATEGY — saturation diff (preferred, requires reference frame):
+        #    Compute abs(sat_live - sat_ref) per pixel, the same way the brightness
+        #    diff works.  Only pixels that became MORE saturated since the empty-bed
+        #    reference was captured are flagged.  The achromatic honeycomb bed stays
+        #    near zero; a vivid coloured workpiece lights up across its full area.
         #
-        #  DETECT_SAT_THRESHOLD: HSV saturation (0–255) above which a pixel is
-        #  considered colored foreground. 0 disables the hint. Default = 40.
-        sat_threshold = int(os.getenv("DETECT_SAT_THRESHOLD", "40"))
+        #  FALLBACK — absolute saturation (no reference frame):
+        #    The threshold is forced to >= 80 to avoid false-positives from the
+        #    warm-toned metal bed.
+        #
+        #  DETECT_SAT_THRESHOLD (0–255, default 30):
+        #    The saturation *change* (or absolute value in fallback mode) above
+        #    which a pixel is treated as coloured foreground.  Set to 0 to disable.
+        sat_threshold = int(os.getenv("DETECT_SAT_THRESHOLD", "30"))
         if sat_threshold > 0:
-            hsv      = cv2.cvtColor(proc, cv2.COLOR_BGR2HSV)
-            sat_ch   = hsv[:, :, 1]                          # 0–255 saturation
-            sat_blur = cv2.GaussianBlur(sat_ch, (smooth_k, smooth_k), 0)
-            _, sat_mask = cv2.threshold(sat_blur, sat_threshold, 255, cv2.THRESH_BINARY)
-            sat_mask = cv2.bitwise_and(sat_mask, sat_mask, mask=mask_roi)
+            hsv          = cv2.cvtColor(proc, cv2.COLOR_BGR2HSV)
+            sat_live     = hsv[:, :, 1]
+            sat_live_blur = cv2.GaussianBlur(sat_live, (smooth_k, smooth_k), 0)
+
+            if ref_sat is not None:
+                ref_sat_blur = cv2.GaussianBlur(ref_sat, (smooth_k, smooth_k), 0)
+                # Only flag pixels that gained saturation vs. the empty bed.
+                sat_gained   = np.clip(
+                    sat_live_blur.astype(np.int16) - ref_sat_blur.astype(np.int16),
+                    0, 255
+                ).astype(np.uint8)
+                _, sat_mask  = cv2.threshold(sat_gained, sat_threshold, 255, cv2.THRESH_BINARY)
+                sat_strategy = f"sat-diff>{sat_threshold}"
+            else:
+                # No reference — require high absolute saturation to avoid bed noise.
+                abs_sat_t = max(sat_threshold, 80)
+                _, sat_mask = cv2.threshold(sat_live_blur, abs_sat_t, 255, cv2.THRESH_BINARY)
+                sat_strategy = f"sat-abs>{abs_sat_t}"
+
+            sat_mask  = cv2.bitwise_and(sat_mask, sat_mask, mask=mask_roi)
             px_before = cv2.countNonZero(raw_mask)
             raw_mask  = cv2.bitwise_or(raw_mask, sat_mask)
             logger.debug(
-                f"Sat-hint: threshold={sat_threshold}  "
+                f"Sat-hint ({sat_strategy}): "
                 f"added {cv2.countNonZero(raw_mask) - px_before} px"
             )
 
