@@ -362,6 +362,13 @@ class InferenceService:
 
                 cv2.polylines(overlay, [pts], True, (0, 220, 0), 2)
                 cv2.arrowedLine(overlay, (cx, cy), (ax, ay), (0, 140, 255), 2, tipLength=0.25)
+
+                # Draw workpiece ID with a black border for readability
+                text = wp['id']
+                text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                tx, ty = cx - text_size[0] // 2, cy - 10
+                cv2.putText(overlay, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(overlay, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
             panel_i = overlay
 
             lbl_args = dict(fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.5, color=(0, 255, 255), thickness=2)
