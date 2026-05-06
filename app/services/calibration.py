@@ -187,60 +187,31 @@ class CalibrationService:
                 p = phys_map[tid]
                 corners = np.array(tag['corners'])
                 
-                # Map corners based on the specified anchor and tag size
-                if 'size_mm' in p:
-                    s = p['size_mm']
-                    g = p.get('guide_mm', 0.0)
-                    half = s / 2.0
-                    px, py = p['x'], p['y']
-                    anchor = p.get('anchor', 'center').lower().replace('_', '-')
-                    
-                    if anchor == 'center':
-                        target_corners = [
-                            [px - half, py + half], # TL (left, up)
-                            [px + half, py + half], # TR (right, up)
-                            [px + half, py - half], # BR (right, down)
-                            [px - half, py - half]  # BL (left, down)
-                        ]
-                    elif anchor in ['top-left', 'tl']:
-                        target_corners = [
-                            [px + g,     py - g    ],  # TL
-                            [px + g + s, py - g    ],  # TR
-                            [px + g + s, py - g - s],  # BR
-                            [px + g,     py - g - s]   # BL
-                        ]
-                    elif anchor in ['top-right', 'tr']:
-                        target_corners = [
-                            [px - g - s, py - g    ],  # TL
-                            [px - g,     py - g    ],  # TR
-                            [px - g,     py - g - s],  # BR
-                            [px - g - s, py - g - s]   # BL
-                        ]
-                    elif anchor in ['bottom-right', 'br']:
-                        target_corners = [
-                            [px - g - s, py + g + s],  # TL
-                            [px - g,     py + g + s],  # TR
-                            [px - g,     py + g    ],  # BR
-                            [px - g - s, py + g    ]   # BL
-                        ]
-                    elif anchor in ['bottom-left', 'bl']:
-                        target_corners = [
-                            [px + g,     py + g + s],  # TL
-                            [px + g + s, py + g + s],  # TR
-                            [px + g + s, py + g    ],  # BR
-                            [px + g,     py + g    ]   # BL
-                        ]
-                    else:
-                        # Default to center
-                        target_corners = [[px-half, py+half], [px+half, py+half], [px+half, py-half], [px-half, py-half]]
-                    
-                    src_pts.extend(corners)
-                    dst_pts.extend(target_corners)
+                # Compute the pixel center of the detected tag
+                center_px = corners.mean(axis=0)
+
+                # Compute the physical center of the tag based on its anchor
+                s = p.get('size_mm', 50.0)
+                g = p.get('guide_mm', 0.0)
+                half = s / 2.0
+                px, py = p['x'], p['y']
+                anchor = p.get('anchor', 'center').lower().replace('_', '-')
+
+                if anchor == 'center':
+                    target_center = [px, py]
+                elif anchor in ['top-left', 'tl']:
+                    target_center = [px + g + half, py - g - half]
+                elif anchor in ['top-right', 'tr']:
+                    target_center = [px - g - half, py - g - half]
+                elif anchor in ['bottom-right', 'br']:
+                    target_center = [px - g - half, py + g + half]
+                elif anchor in ['bottom-left', 'bl']:
+                    target_center = [px + g + half, py + g + half]
                 else:
-                    # Fallback to center point if size unknown
-                    center = corners.mean(axis=0)
-                    src_pts.append(center)
-                    dst_pts.append([p['x'], p['y']])
+                    target_center = [px, py]
+
+                src_pts.append(center_px)
+                dst_pts.append(target_center)
         
         if len(src_pts) < 4:
             raise ValueError("Need at least 4 points (1 tag with size or 4 center points) for calibration")
