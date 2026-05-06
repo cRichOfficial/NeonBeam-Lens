@@ -147,8 +147,9 @@ class InferenceService:
         ).astype(np.uint8)
 
     def _compute_combined_score(self, b_diff: np.ndarray, s_diff: np.ndarray) -> np.ndarray:
-        # Simple addition clamped to 255
-        return cv2.add(b_diff, s_diff)
+        # Take the maximum of either the brightness change or the color change.
+        # This prevents the background noise floors of the two channels from stacking together.
+        return cv2.max(b_diff, s_diff)
 
     def _apply_threshold(self, combined_score: np.ndarray, threshold: int) -> np.ndarray:
         _, mask = cv2.threshold(combined_score, threshold, 255, cv2.THRESH_BINARY)
