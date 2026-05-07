@@ -338,6 +338,7 @@ async def calculate_transform(
     design_height_mm: Optional[float] = Form(None),
     dpi: Optional[float] = Form(None),
     padding_mm: float = Form(5.0),
+    material_height_mm: float = Form(0.0),
     design_file: Optional[UploadFile] = File(None)
 ):
     # 1. Get current detection for the workpiece
@@ -363,8 +364,20 @@ async def calculate_transform(
         raise HTTPException(status_code=400, detail="Missing design dimensions or image + DPI")
 
     # 3. Calculate transform
-    result = transform_service.calculate_transform(design_data, wp, padding_mm)
+    result = transform_service.calculate_transform(
+        design_data, wp, padding_mm, 
+        material_height_mm=material_height_mm,
+        debug_frame=frame
+    )
     return result
+
+@app.get("/api/lens/transform/debug-image")
+async def get_transform_debug_image():
+    """Returns the visual debug image from the last transform calculation."""
+    debug_path = "calibration_data/transform_debug.jpg"
+    if not os.path.exists(debug_path):
+        raise HTTPException(status_code=404, detail="Transform debug image not found. Run /api/lens/transform first.")
+    return FileResponse(debug_path, media_type="image/jpeg")
 
 @app.get("/api/lens/stream")
 async def stream_video():

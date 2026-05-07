@@ -35,6 +35,10 @@ class CalibrationService:
 
         # Y-axis flip: camera sees Y=0 at top, laser bed uses Y=0 at bottom-left.
         self.workspace_height_mm = float(os.getenv("WORKSPACE_HEIGHT_MM", "0"))
+        
+        # Camera mounting height above bed (Z=0).
+        # Used for parallax compensation if provided.
+        self.camera_height_mm = float(os.getenv("CAMERA_HEIGHT_MM", "0"))
 
         self.load_calibration()
         self._load_lens_calibration()
@@ -278,18 +282,46 @@ class CalibrationService:
             cv2.INTER_LINEAR,
         )
 
-    def map_pixels_to_mm(self, points_px: np.ndarray) -> np.ndarray:
+    def map_pixels_to_mm(self, points_px: np.ndarray, height_mm: float = 0.0) -> np.ndarray:
         """Transform pixel coordinates to physical mm using the calibration homography.
         
-        The homography already encodes the full coordinate transform (including
-        Y-axis orientation) because the calibration destination points are
-        provided by the user in their physical coordinate system.
+        If height_mm > 0, compensates for parallax error using lens intrinsics.
+        Requires that lens_calibrated is True and homography_matrix is loaded.
         """
         if self.homography_matrix is None:
             return points_px # No calibration
             
-        # points_px should be shape (N, 2)
-        pts = points_px.reshape(-1, 1, 2).astype(np.float32)
+        # 1. Parallax Compensation (if height is provided)
+        # We need to shift the pixel coordinates as if they were viewed at Z=0 
+        # instead of Z=height_mm.
+        proc_pts = points_px.copy()
+        
+        if height_mm > 0 and self.lens_calibrated and self.camera_height_mm > 0:
+            # Normalized camera coordinates (rays in 3D space)
+            # points_px are already undistorted (pipeline standard)
+            pts_norm = cv2.undistortPoints(
+                proc_pts.reshape(-1, 1, 2), 
+                self.camera_matrix, 
+                None # No distortion coeffs because input is already undistorted
+            ).reshape(-1, 2)
+            
+            # Intersection with Z=0 vs Z=height_mm
+            # The "lean" factor: how much further from the center the point appears
+            # at height_mm vs at the bed level.
+            # Scaling factor k = (CameraHeight) / (CameraHeight - ObjectHeight)
+            # We want to move the pixel CLOSER to the principal point (optical center).
+            k = (self.camera_height_mm - height_mm) / self.camera_height_mm
+            
+            # Principal point (cx, cy) from camera matrix
+            cx = self.camera_matrix[0, 2]
+            cy = self.camera_matrix[1, 2]
+            
+            # Shift pixels toward the principal point
+            proc_pts[:, 0] = cx + (proc_pts[:, 0] - cx) * k
+            proc_pts[:, 1] = cy + (proc_pts[:, 1] - cy) * k
+
+        # 2. Homography Mapping
+        pts = proc_pts.reshape(-1, 1, 2).astype(np.float32)
         transformed = cv2.perspectiveTransform(pts, self.homography_matrix).reshape(-1, 2)
         return transformed
 
@@ -365,7 +397,7 @@ class CalibrationService:
 
             p = phys_map[tid]
             center_px_f = corners.mean(axis=0).reshape(1, 2).astype(np.float32)
-            center_mm = self.map_pixels_to_mm(center_px_f)[0]
+            center_mm = self.map_pixels_to_mm(center_px_f, height_mm=0.0)[0]
 
             s = p.get("size_mm", 50.0)
             g = p.get("guide_mm", 0.0)

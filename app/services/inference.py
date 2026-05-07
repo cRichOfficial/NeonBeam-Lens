@@ -220,8 +220,8 @@ class InferenceService:
             seg_px = hull_full.reshape(-1, 2).tolist()
             x, y, w, h = cv2.boundingRect(cnt_full)
 
-            corners_mm = cal.map_pixels_to_mm(corners_px.astype(np.float32))
-            seg_mm = cal.map_pixels_to_mm(np.array(seg_px, dtype=np.float32))
+            corners_mm = cal.map_pixels_to_mm(corners_px.astype(np.float32), height_mm=0.0)
+            seg_mm = cal.map_pixels_to_mm(np.array(seg_px, dtype=np.float32), height_mm=0.0)
 
             area_mm2 = float(cv2.contourArea(corners_mm.reshape(-1, 1, 2).astype(np.float32)))
             
