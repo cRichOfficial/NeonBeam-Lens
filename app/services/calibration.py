@@ -286,39 +286,38 @@ class CalibrationService:
         """Transform pixel coordinates to physical mm using the calibration homography.
         
         If height_mm > 0, compensates for parallax error using lens intrinsics.
-        Requires that lens_calibrated is True and homography_matrix is loaded.
+        Scaling is performed in Physical MM space to ensure maximum accuracy.
         """
         if self.homography_matrix is None:
             return points_px # No calibration
             
-        # 1. Parallax Compensation (if height is provided)
-        # We need to shift the pixel coordinates as if they were viewed at Z=0 
-        # instead of Z=height_mm.
-        proc_pts = points_px.copy()
+        # 1. Standard Homography Mapping (Floor Level / Z=0)
+        pts = points_px.reshape(-1, 1, 2).astype(np.float32)
+        floor_mm = cv2.perspectiveTransform(pts, self.homography_matrix).reshape(-1, 2)
         
+        # 2. Parallax Compensation (if height is provided)
         if height_mm > 0 and self.lens_calibrated and self.camera_height_mm > 0:
-            # Normalized camera coordinates (rays in 3D space)
-            # points_px are already undistorted (pipeline standard)
-            pts_norm = cv2.undistortPoints(
-                proc_pts.reshape(-1, 1, 2), 
-                self.camera_matrix, 
-                None # No distortion coeffs because input is already undistorted
-            ).reshape(-1, 2)
+            # We need to pull the "shifted" floor_mm coordinates back toward the 
+            # physical optical center of the camera.
             
-            # Intersection with Z=0 vs Z=height_mm
-            # The "lean" factor: how much further from the center the point appears
-            # at height_mm vs at the bed level.
-            # Scaling factor k = (CameraHeight) / (CameraHeight - ObjectHeight)
-            # We want to move the pixel CLOSER to the principal point (optical center).
-            k = (self.camera_height_mm - height_mm) / self.camera_height_mm
-            
-            # Principal point (cx, cy) from camera matrix
+            # Find the physical optical center (where the camera looks straight down)
+            # This is the principal point (cx, cy) mapped to the bed.
             cx = self.camera_matrix[0, 2]
             cy = self.camera_matrix[1, 2]
+            opt_pt = np.array([[[cx, cy]]], dtype=np.float32)
+            opt_mm = cv2.perspectiveTransform(opt_pt, self.homography_matrix).reshape(2)
             
-            # Shift pixels toward the principal point
-            proc_pts[:, 0] = cx + (proc_pts[:, 0] - cx) * k
-            proc_pts[:, 1] = cy + (proc_pts[:, 1] - cy) * k
+            # Compensation ratio: k = (CameraHeight - ObjectHeight) / CameraHeight
+            # If h=10 and H=400, k=0.975. We pull the point 2.5% closer to center.
+            k = (self.camera_height_mm - height_mm) / self.camera_height_mm
+            
+            # Apply scaling in physical space
+            corrected_mm = floor_mm.copy()
+            corrected_mm[:, 0] = opt_mm[0] + (floor_mm[:, 0] - opt_mm[0]) * k
+            corrected_mm[:, 1] = opt_mm[1] + (floor_mm[:, 1] - opt_mm[1]) * k
+            return corrected_mm
+
+        return floor_mm
 
         # 2. Homography Mapping
         pts = proc_pts.reshape(-1, 1, 2).astype(np.float32)
