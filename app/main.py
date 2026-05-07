@@ -73,12 +73,12 @@ class CalibrationRequest(BaseModel):
     tags: List[CalibrationPoint]
 
 class TransformRequest(BaseModel):
-    workpiece_id: str
+    workpiece: Dict[str, Any]
+    material_height_mm: float = 0.0
     design_width_mm: Optional[float] = None
     design_height_mm: Optional[float] = None
     dpi: Optional[float] = None
     padding_mm: float = 5.0
-    # For file uploads, we'll handle separately
 
 # Endpoints
 @app.get("/api/health")
@@ -332,41 +332,31 @@ async def get_calibration_tags():
     return {"tags": status["calibration_data"].get("physical_data", [])}
 
 @app.post("/api/lens/transform")
-async def calculate_transform(
-    workpiece_id: str = Form(...),
-    design_width_mm: Optional[float] = Form(None),
-    design_height_mm: Optional[float] = Form(None),
-    dpi: Optional[float] = Form(None),
-    padding_mm: float = Form(5.0),
-    material_height_mm: float = Form(0.0),
-    design_file: Optional[UploadFile] = File(None)
-):
-    # 1. Get current detection for the workpiece
-    frame = camera_service.get_frame()
-    workpieces = inference_service.detect_workpieces(frame)
+async def calculate_transform(request: TransformRequest):
+    """
+    Calculate transformation parameters using provided workpiece data.
+    If material_height_mm > 0, performs parallax compensation.
+    """
+    wp = request.workpiece
     
-    wp = next((w for w in workpieces if w["id"] == workpiece_id), None)
-    if not wp:
-        # Fallback: if no specific ID match, use the first one if only one exists
-        if len(workpieces) == 1:
-            wp = workpieces[0]
-        else:
-            raise HTTPException(status_code=404, detail="Workpiece not found")
+    # 1. Capture current frame for debug image (optional but helpful)
+    frame = camera_service.get_frame()
 
     # 2. Prepare design data
     design_data = {}
-    if design_width_mm and design_height_mm:
-        design_data = {"width_mm": design_width_mm, "height_mm": design_height_mm}
-    elif design_file and dpi:
-        file_bytes = await design_file.read()
-        design_data = {"image_data": file_bytes, "dpi": dpi}
+    if request.design_width_mm and request.design_height_mm:
+        design_data = {"width_mm": request.design_width_mm, "height_mm": request.design_height_mm}
+    elif request.dpi:
+        # Note: In this JSON-only version, we assume dimensions or previous upload
+        design_data = {"dpi": request.dpi}
     else:
-        raise HTTPException(status_code=400, detail="Missing design dimensions or image + DPI")
+        # If no design dims, we'll just calculate workpiece correction
+        design_data = {"width_mm": 10.0, "height_mm": 10.0} 
 
     # 3. Calculate transform
     result = transform_service.calculate_transform(
-        design_data, wp, padding_mm, 
-        material_height_mm=material_height_mm,
+        design_data, wp, request.padding_mm, 
+        material_height_mm=request.material_height_mm,
         debug_frame=frame
     )
     return result
