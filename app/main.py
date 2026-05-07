@@ -317,6 +317,20 @@ async def detect_objects():
         "debug_image_url": "/api/lens/detect/debug-image"
     }
 
+@app.get("/api/lens/calibration/tags")
+async def get_calibration_tags():
+    """
+    Retrieve current AprilTag calibration data.
+    Returns a list of tags with their physical locations, anchors, and sizes.
+    Used by the frontend to display existing tag locations on the workspace.
+    """
+    status = calibration_service.get_status()
+    if status["status"] != "calibrated" or "calibration_data" not in status:
+        return {"tags": []}
+    
+    # Return the raw physical_data from the stored calibration
+    return {"tags": status["calibration_data"].get("physical_data", [])}
+
 @app.post("/api/lens/transform")
 async def calculate_transform(
     workpiece_id: str = Form(...),
