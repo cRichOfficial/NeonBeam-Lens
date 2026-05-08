@@ -291,45 +291,60 @@ class CalibrationService:
     def map_pixels_to_mm(self, points_px: np.ndarray, height_mm: float = 0.0) -> np.ndarray:
         """Transform pixel coordinates to physical mm using the calibration homography.
         
-        If height_mm > 0, compensates for parallax error using lens intrinsics.
-        Scaling is performed in Physical MM space to ensure maximum accuracy.
+        If height_mm > 0, compensates for parallax error by projecting 3D rays 
+        from the material surface back to the physical bed (Z=0).
         """
         if self.homography_matrix is None:
             return points_px # No calibration
             
-        # 1. Standard Homography Mapping (Floor Level / Z=0)
-        pts = points_px.reshape(-1, 1, 2).astype(np.float32)
-        floor_mm = cv2.perspectiveTransform(pts, self.homography_matrix).reshape(-1, 2)
+        # 1. Parallax Correction (3D Ray Projection)
+        # We need to find the 2D pixel coordinate on the Z=0 plane that 
+        # corresponds to the same physical point seen at Z=height_mm.
+        proc_pts_px = points_px.copy()
         
-        # 2. Parallax Compensation (if height is provided)
         if height_mm > 0 and self.lens_calibrated and self.camera_height_mm > 0:
-            # We need to pull the "shifted" floor_mm coordinates back toward the 
-            # physical optical center of the camera.
+            # Normalized camera coordinates (u, v) where z=1
+            # points_px are undistorted, so we can use the camera matrix directly.
+            pts_norm = cv2.undistortPoints(
+                points_px.reshape(-1, 1, 2), 
+                self.camera_matrix, 
+                None 
+            ).reshape(-1, 2)
             
-            # Find the physical optical center (where the camera looks straight down)
-            if self.camera_center_x is not None and self.camera_center_y is not None:
-                opt_mm = np.array([self.camera_center_x, self.camera_center_y], dtype=np.float32)
-            else:
-                cx = self.camera_matrix[0, 2]
-                cy = self.camera_matrix[1, 2]
-                opt_pt = np.array([[[cx, cy]]], dtype=np.float32)
-                opt_mm = cv2.perspectiveTransform(opt_pt, self.homography_matrix).reshape(2)
+            # Intersection logic:
+            # Ray: P(t) = t * [u, v, 1]
+            # Height of camera: H (self.camera_height_mm)
+            # Height of object: h (height_mm)
+            # Distance from camera to bed: H
+            # Distance from camera to object top: H - h
             
-            # PARALLAX CORRECTION LOGIC:
-            # In overhead perspective, the top of an object appears FURTHER 
-            # from the optical center than the base.
-            # To find the base, we pull the point TOWARD the optical center.
-            # Scale factor = (CameraHeight - ObjectHeight) / CameraHeight
-            k = (self.camera_height_mm - height_mm) / self.camera_height_mm
+            # The pixel we see (u, v) comes from the object top at z = H - h.
+            # The physical point is at [u*(H-h), v*(H-h), H-h] in camera space.
+            # We want to find where a ray from the camera through this point
+            # hits the bed (z = H).
+            # But wait! The camera *is* at z=0 in its own space. The bed is at z=H.
+            # The object top is at z = H - h.
             
-            # Apply scaling TOWARD the optical center
-            logger.debug(f"Parallax math: opt_mm={opt_mm}, h={height_mm}, k={k:.4f}")
-            corrected_mm = floor_mm.copy()
-            corrected_mm[:, 0] = opt_mm[0] + (floor_mm[:, 0] - opt_mm[0]) * k
-            corrected_mm[:, 1] = opt_mm[1] + (floor_mm[:, 1] - opt_mm[1]) * k
-            return corrected_mm
+            # Scale the normalized coordinates to find the "floor-equivalent" pixels.
+            # floor_u = u * (H / (H - h))
+            # floor_v = v * (H / (H - h))
+            k = self.camera_height_mm / (self.camera_height_mm - height_mm)
+            
+            # Back-project to pixels on the Z=0 plane
+            fx = self.camera_matrix[0, 0]
+            fy = self.camera_matrix[1, 1]
+            cx = self.camera_matrix[0, 2]
+            cy = self.camera_matrix[1, 2]
+            
+            proc_pts_px[:, 0] = (pts_norm[:, 0] * k) * fx + cx
+            proc_pts_px[:, 1] = (pts_norm[:, 1] * k) * fy + cy
+            
+            logger.debug(f"Parallax 3D: height={height_mm}, k={k:.4f}")
 
-        return floor_mm
+        # 2. Standard Homography Mapping
+        pts = proc_pts_px.reshape(-1, 1, 2).astype(np.float32)
+        transformed = cv2.perspectiveTransform(pts, self.homography_matrix).reshape(-1, 2)
+        return transformed
 
     def get_undistorted_view(self, image: np.ndarray, size_mm: Tuple[int, int] = (500, 500)) -> np.ndarray:
         """Returns a de-warped top-down view of the workspace."""
