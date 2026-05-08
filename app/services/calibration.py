@@ -204,7 +204,9 @@ class CalibrationService:
     def calibrate(self, detected_tags: List[Dict], physical_data: List[Dict]):
         """
         Compute homography matrix from detected tags and their physical locations.
-        physical_data: list of {'id': 1, 'x        src_pts = [] # Pixel corners
+        physical_data: list of {'id': 1, 'x': 0, 'y': 0, 'anchor': 'center', 'size_mm': 50}
+        """
+        src_pts = [] # Pixel corners
         obj_pts_3d = [] # World MM corners (Z=0)
         
         # Mapping centers for Homography (backward compatibility/legacy)
