@@ -51,7 +51,7 @@ class CalibrationService:
         
         # Pre-calculate the optimal camera matrix for the current workspace resolution
         # This ensures parallax math has the correct focal length from the start.
-        if self.lens_calibrated and self.workspace_width_mm > 0:
+        if self.lens_calibrated:
             # We use a default/last known resolution or a standard one
             w, h = 1920, 1080 # Default if not yet known
             if self.is_fisheye:
