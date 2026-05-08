@@ -344,11 +344,7 @@ class CalibrationService:
         )
 
     def map_pixels_to_mm(self, points_px: np.ndarray, height_mm: float = 0.0) -> np.ndarray:
-        """Transform pixel coordinates to physical mm using the calibration homography.
-        
-        If height_mm > 0, compensates for parallax error by projecting 3D rays 
-        from the material surface back to the physical bed (Z=0).
-        """
+        """Map pixels to MM."""
         if self.homography_matrix is None:
             return points_px # No calibration
             
