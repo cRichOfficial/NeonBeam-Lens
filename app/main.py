@@ -1,4 +1,5 @@
 import asyncio
+import numpy as np
 import logging
 import sys
 import io
