@@ -304,9 +304,6 @@ class CalibrationService:
                 
             return matrix
         return None
-              
-            return matrix
-        return None
 
     def undistort(self, image: np.ndarray) -> np.ndarray:
         """Apply lens distortion correction using calibrated K/D coefficients.
