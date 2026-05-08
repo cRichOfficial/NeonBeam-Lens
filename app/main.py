@@ -15,6 +15,8 @@ from .services.mdns_advertiser import MdnsAdvertiser
 from .services.camera import camera_service
 from .services.calibration import (
     calibration_service, AprilTagGenerator, CheckerboardGenerator,
+    LensCalibrationSession,
+)
 from .services.inference import inference_service
 
 # Robust Debug Logging
