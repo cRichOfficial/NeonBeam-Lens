@@ -204,10 +204,12 @@ class CalibrationService:
     def calibrate(self, detected_tags: List[Dict], physical_data: List[Dict]):
         """
         Compute homography matrix from detected tags and their physical locations.
-        physical_data: list of {'id': 1, 'x': 0, 'y': 0, 'anchor': 'center', 'size_mm': 50}
-        """
-        src_pts = []
-        dst_pts = []
+        physical_data: list of {'id': 1, 'x        src_pts = [] # Pixel corners
+        obj_pts_3d = [] # World MM corners (Z=0)
+        
+        # Mapping centers for Homography (backward compatibility/legacy)
+        src_centers = []
+        dst_centers = []
         
         # Create map for quick lookup
         phys_map = {item['id']: item for item in physical_data}
@@ -216,56 +218,73 @@ class CalibrationService:
             tid = tag['id']
             if tid in phys_map:
                 p = phys_map[tid]
-                corners = np.array(tag['corners'])
+                corners_px = np.array(tag['corners'], dtype=np.float32)
                 
-                # Compute the pixel center of the detected tag
-                center_px = corners.mean(axis=0)
-
-                # Compute the physical center of the tag based on its anchor
+                # Physical tag geometry
                 s = p.get('size_mm', 50.0)
                 g = p.get('guide_mm', 0.0)
                 half = s / 2.0
                 px, py = p['x'], p['y']
                 anchor = p.get('anchor', 'center').lower().replace('_', '-')
 
+                # 1. Calculate the physical center (for legacy homography)
                 if anchor == 'center':
-                    target_center = [px, py]
+                    tc = [px, py]
                 elif anchor in ['top-left', 'tl']:
-                    target_center = [px + g + half, py - g - half]
+                    tc = [px + g + half, py - g - half]
                 elif anchor in ['top-right', 'tr']:
-                    target_center = [px - g - half, py - g - half]
+                    tc = [px - g - half, py - g - half]
                 elif anchor in ['bottom-right', 'br']:
-                    target_center = [px - g - half, py + g + half]
+                    tc = [px - g - half, py + g + half]
                 elif anchor in ['bottom-left', 'bl']:
-                    target_center = [px + g + half, py + g + half]
+                    tc = [px + g + half, py + g + half]
                 else:
-                    target_center = [px, py]
+                    tc = [px, py]
+                
+                src_centers.append(corners_px.mean(axis=0))
+                dst_centers.append(tc)
 
-                src_pts.append(center_px)
-                dst_pts.append(target_center)
+                # 2. Calculate the 4 physical corners (for 3D Pose / solvePnP)
+                # AprilTag corner order: TL, TR, BR, BL
+                # We define the world coordinates on the bed plane (Z=0)
+                tc_arr = np.array(tc)
+                world_corners = np.array([
+                    tc_arr + [-half, -half], # TL
+                    tc_arr + [half, -half],  # TR
+                    tc_arr + [half, half],   # BR
+                    tc_arr + [-half, half]   # BL
+                ], dtype=np.float32)
+                
+                for i in range(4):
+                    src_pts.append(corners_px[i])
+                    obj_pts_3d.append(world_corners[i])
         
-        if len(src_pts) < 4:
-            raise ValueError("Need at least 4 points (1 tag with size or 4 center points) for calibration")
+        if len(src_centers) < 1:
+            raise ValueError("No matching tags found for calibration")
             
-        src_pts = np.array(src_pts, dtype=np.float32)
-        dst_pts = np.array(dst_pts, dtype=np.float32)
-        
-        # Use least-squares (0) instead of RANSAC. Aruco IDs guarantee correct 
-        # correspondences, and RANSAC can incorrectly discard entire tags if minor 
-        # lens distortion makes them slightly non-planar, causing the matrix to 
-        # overfit to a single tag.
-        matrix, status = cv2.findHomography(src_pts, dst_pts, 0)
+        # Homography Matrix
+        matrix, _ = cv2.findHomography(np.array(src_centers), np.array(dst_centers), 0)
         
         if matrix is not None:
             # --- AUTO-HEIGHT DERIVATION (solvePnP) ---
             derived_height = 0.0
-            if self.lens_calibrated:
-                obj_pts_3d = np.zeros((len(dst_pts), 3), dtype=np.float32)
-                obj_pts_3d[:, :2] = dst_pts
+            if self.lens_calibrated and len(src_pts) >= 4:
+                # We need to scale the camera matrix to the current frame size
+                # Detect the resolution from the pixel coordinates
+                w = int(max(p[0] for p in src_pts))
+                h = int(max(p[1] for p in src_pts))
+                # Add some buffer to ensure we aren't at the very edge
+                w = max(w, 640); h = max(h, 480) 
+                
+                # Use the principal point and focal length scaled to this resolution
+                # But wait! undistortPoints and solvePnP expect the intrinsics 
+                # that match the pixel coordinates. 
+                # Since src_pts are from an undistorted image, we use the matrix 
+                # that was used to undistort them.
                 k_matrix = getattr(self, "_undistorted_camera_matrix", self.camera_matrix)
                 
                 success, rvec, tvec = cv2.solvePnP(
-                    obj_pts_3d, src_pts, k_matrix, None, flags=cv2.SOLVEPNP_ITERATIVE
+                    np.array(obj_pts_3d), np.array(src_pts), k_matrix, None
                 )
                 if success:
                     R, _ = cv2.Rodrigues(rvec)
@@ -280,10 +299,12 @@ class CalibrationService:
             }
             self.save_calibration(matrix, calib_data)
             
-            # Immediately apply to current session
             if derived_height > 0:
                 self.camera_height_mm = derived_height
                 
+            return matrix
+        return None
+              
             return matrix
         return None
 
