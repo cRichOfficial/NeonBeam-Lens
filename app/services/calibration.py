@@ -306,11 +306,7 @@ class CalibrationService:
         return None
 
     def undistort(self, image: np.ndarray) -> np.ndarray:
-        """
-        Apply lens distortion correction using calibrated K/D coefficients.
-        Uses cached remap tables for performance (~1ms per frame). 
-        The maps are rebuilt automatically if the frame resolution changes.
-        """
+        """Undistort image."""
         if not self.lens_calibrated:
             return image
 
