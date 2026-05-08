@@ -271,28 +271,23 @@ class CalibrationService:
             # --- AUTO-HEIGHT DERIVATION (solvePnP) ---
             derived_height = 0.0
             if self.lens_calibrated and len(src_pts) >= 4:
-                # We need to scale the camera matrix to the current frame size
-                # Detect the resolution from the pixel coordinates
-                w = int(max(p[0] for p in src_pts))
-                h = int(max(p[1] for p in src_pts))
-                # Add some buffer to ensure we aren't at the very edge
-                w = max(w, 640); h = max(h, 480) 
-                
-                # Use the principal point and focal length scaled to this resolution
-                # But wait! undistortPoints and solvePnP expect the intrinsics 
-                # that match the pixel coordinates. 
-                # Since src_pts are from an undistorted image, we use the matrix 
-                # that was used to undistort them.
-                k_matrix = getattr(self, "_undistorted_camera_matrix", self.camera_matrix)
-                
-                success, rvec, tvec = cv2.solvePnP(
-                    np.array(obj_pts_3d), np.array(src_pts), k_matrix, None
-                )
-                if success:
-                    R, _ = cv2.Rodrigues(rvec)
-                    cam_pos = -R.T @ tvec
-                    derived_height = abs(float(cam_pos[2]))
-                    logger.info(f"Derived camera height from calibration: {derived_height:.2f}mm")
+                try:
+                    # solvePnP prefers (N, 1, 2) and (N, 1, 3) float32 arrays
+                    op3d = np.array(obj_pts_3d, dtype=np.float32).reshape(-1, 1, 3)
+                    ip2d = np.array(src_pts, dtype=np.float32).reshape(-1, 1, 2)
+                    
+                    k_matrix = getattr(self, "_undistorted_camera_matrix", self.camera_matrix)
+                    
+                    success, rvec, tvec = cv2.solvePnP(
+                        op3d, ip2d, k_matrix, None, flags=cv2.SOLVEPNP_ITERATIVE
+                    )
+                    if success:
+                        R, _ = cv2.Rodrigues(rvec)
+                        cam_pos = -R.T @ tvec
+                        derived_height = abs(float(cam_pos[2]))
+                        logger.info(f"Derived camera height from calibration: {derived_height:.2f}mm")
+                except Exception as e:
+                    logger.warning(f"Could not derive camera height: {e}")
             
             calib_data = {
                 "detected_tags": detected_tags,
