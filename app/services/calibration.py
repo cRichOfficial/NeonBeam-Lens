@@ -282,6 +282,7 @@ class CalibrationService:
                         None, new_k, (w, h), cv2.CV_16SC2,
                     )
             self._undistort_resolution = (w, h)
+            self._undistorted_camera_matrix = new_k
 
         return cv2.remap(
             image, self._undistort_map1, self._undistort_map2,
@@ -314,11 +315,13 @@ class CalibrationService:
             # Factor k = (CameraHeight - ObjectHeight) / CameraHeight
             k = (self.camera_height_mm - height_mm) / self.camera_height_mm
             
-            # Use the principal point and focal length from the matrix
-            fx = self.camera_matrix[0, 0]
-            fy = self.camera_matrix[1, 1]
-            cx = self.camera_matrix[0, 2]
-            cy = self.camera_matrix[1, 2]
+            # Use the principal point and focal length from the undistorted matrix
+            # if available, otherwise fall back to the raw matrix.
+            matrix = getattr(self, "_undistorted_camera_matrix", self.camera_matrix)
+            fx = matrix[0, 0]
+            fy = matrix[1, 1]
+            cx = matrix[0, 2]
+            cy = matrix[1, 2]
             
             # Pull pixels toward the principal point in pixel space
             # This is equivalent to the 3D ray projection but simpler to compute
