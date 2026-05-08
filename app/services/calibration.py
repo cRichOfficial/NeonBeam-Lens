@@ -251,10 +251,10 @@ class CalibrationService:
                 # We define the world coordinates on the bed plane (Z=0)
                 tc_arr = np.array(tc)
                 world_corners = np.array([
-                    tc_arr + [-half, -half], # TL
-                    tc_arr + [half, -half],  # TR
-                    tc_arr + [half, half],   # BR
-                    tc_arr + [-half, half]   # BL
+                    [tc[0] - half, tc[1] - half, 0], # TL
+                    [tc[0] + half, tc[1] - half, 0], # TR
+                    [tc[0] + half, tc[1] + half, 0], # BR
+                    [tc[0] - half, tc[1] + half, 0]  # BL
                 ], dtype=np.float32)
                 
                 for i in range(4):
