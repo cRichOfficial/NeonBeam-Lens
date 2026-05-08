@@ -316,31 +316,20 @@ class CalibrationService:
                 opt_mm = cv2.perspectiveTransform(opt_pt, self.homography_matrix).reshape(2)
             
             # PARALLAX CORRECTION LOGIC:
-            # We see the point on the TOP of the object (floor_mm).
-            # We want to find the point on the BASE of the object (corrected_mm).
-            # The base is further from the optical center than the top appears.
-            # Scale factor = CameraHeight / (CameraHeight - ObjectHeight)
-            # Ensure we don't divide by zero if material height >= camera height
-            denom = self.camera_height_mm - height_mm
-            if denom <= 0:
-                logger.warning("Material height exceeds or equals camera height; skipping parallax correction.")
-                return floor_mm
-                
-            k = self.camera_height_mm / denom
+            # In overhead perspective, the top of an object appears FURTHER 
+            # from the optical center than the base.
+            # To find the base, we pull the point TOWARD the optical center.
+            # Scale factor = (CameraHeight - ObjectHeight) / CameraHeight
+            k = (self.camera_height_mm - height_mm) / self.camera_height_mm
             
-            # Apply scaling AWAY from the optical center
-            logger.debug(f"Parallax math: opt_mm={opt_mm}, k={k:.4f}")
+            # Apply scaling TOWARD the optical center
+            logger.debug(f"Parallax math: opt_mm={opt_mm}, h={height_mm}, k={k:.4f}")
             corrected_mm = floor_mm.copy()
             corrected_mm[:, 0] = opt_mm[0] + (floor_mm[:, 0] - opt_mm[0]) * k
             corrected_mm[:, 1] = opt_mm[1] + (floor_mm[:, 1] - opt_mm[1]) * k
             return corrected_mm
 
         return floor_mm
-
-        # 2. Homography Mapping
-        pts = proc_pts.reshape(-1, 1, 2).astype(np.float32)
-        transformed = cv2.perspectiveTransform(pts, self.homography_matrix).reshape(-1, 2)
-        return transformed
 
     def get_undistorted_view(self, image: np.ndarray, size_mm: Tuple[int, int] = (500, 500)) -> np.ndarray:
         """Returns a de-warped top-down view of the workspace."""
