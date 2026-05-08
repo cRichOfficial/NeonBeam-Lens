@@ -72,6 +72,10 @@ class CalibrationPoint(BaseModel):
 class CalibrationRequest(BaseModel):
     tags: List[CalibrationPoint]
 
+class CorrectionRequest(BaseModel):
+    workpiece: Dict[str, Any]
+    material_height_mm: float
+
 class TransformRequest(BaseModel):
     workpiece: Dict[str, Any]
     material_height_mm: float = 0.0
@@ -360,6 +364,23 @@ async def calculate_transform(request: TransformRequest):
         debug_frame=frame
     )
     return result
+
+@app.post("/api/lens/correct-workpiece")
+async def correct_workpiece(request: CorrectionRequest):
+    """
+    Returns only the parallax-corrected geometry for a workpiece.
+    Useful for updating the UI representation without calculating a full transform.
+    """
+    frame = camera_service.get_frame()
+    
+    # We use a dummy design size since we only care about the corrected workpiece data
+    dummy_design = {"width_mm": 10.0, "height_mm": 10.0}
+    result = transform_service.calculate_transform(
+        dummy_design, request.workpiece, 0.0,
+        material_height_mm=request.material_height_mm,
+        debug_frame=frame
+    )
+    return {"workpiece": result["workpiece"]}
 
 @app.get("/api/lens/transform/debug-image")
 async def get_transform_debug_image():

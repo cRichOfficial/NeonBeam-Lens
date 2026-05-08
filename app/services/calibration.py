@@ -37,8 +37,14 @@ class CalibrationService:
         self.workspace_height_mm = float(os.getenv("WORKSPACE_HEIGHT_MM", "0"))
         
         # Camera mounting height above bed (Z=0).
-        # Used for parallax compensation if provided.
         self.camera_height_mm = float(os.getenv("CAMERA_HEIGHT_MM", "0"))
+        
+        # Optional manual overrides for the optical center in physical MM.
+        # If not set, we calculate it from the principal point + homography.
+        self.camera_center_x = os.getenv("CAMERA_CENTER_X_MM")
+        self.camera_center_y = os.getenv("CAMERA_CENTER_Y_MM")
+        if self.camera_center_x: self.camera_center_x = float(self.camera_center_x)
+        if self.camera_center_y: self.camera_center_y = float(self.camera_center_y)
 
         self.load_calibration()
         self._load_lens_calibration()
@@ -301,14 +307,18 @@ class CalibrationService:
             # physical optical center of the camera.
             
             # Find the physical optical center (where the camera looks straight down)
-            # This is the principal point (cx, cy) mapped to the bed.
-            cx = self.camera_matrix[0, 2]
-            cy = self.camera_matrix[1, 2]
-            opt_pt = np.array([[[cx, cy]]], dtype=np.float32)
-            opt_mm = cv2.perspectiveTransform(opt_pt, self.homography_matrix).reshape(2)
+            if self.camera_center_x is not None and self.camera_center_y is not None:
+                opt_mm = np.array([self.camera_center_x, self.camera_center_y], dtype=np.float32)
+            else:
+                # Calculate from principal point (cx, cy)
+                cx = self.camera_matrix[0, 2]
+                cy = self.camera_matrix[1, 2]
+                opt_pt = np.array([[[cx, cy]]], dtype=np.float32)
+                opt_mm = cv2.perspectiveTransform(opt_pt, self.homography_matrix).reshape(2)
             
-            # Compensation ratio: k = (CameraHeight - ObjectHeight) / CameraHeight
-            # If h=10 and H=400, k=0.975. We pull the point 2.5% closer to center.
+            # The parallax shift pulls the "top" coordinate (floor_mm) back toward 
+            # the optical center (opt_mm) to find the base.
+            # Scaling factor k = (CameraHeight - ObjectHeight) / CameraHeight
             k = (self.camera_height_mm - height_mm) / self.camera_height_mm
             
             # Apply scaling in physical space
