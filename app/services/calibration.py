@@ -310,18 +310,25 @@ class CalibrationService:
             if self.camera_center_x is not None and self.camera_center_y is not None:
                 opt_mm = np.array([self.camera_center_x, self.camera_center_y], dtype=np.float32)
             else:
-                # Calculate from principal point (cx, cy)
                 cx = self.camera_matrix[0, 2]
                 cy = self.camera_matrix[1, 2]
                 opt_pt = np.array([[[cx, cy]]], dtype=np.float32)
                 opt_mm = cv2.perspectiveTransform(opt_pt, self.homography_matrix).reshape(2)
             
-            # The parallax shift pulls the "top" coordinate (floor_mm) back toward 
-            # the optical center (opt_mm) to find the base.
-            # Scaling factor k = (CameraHeight - ObjectHeight) / CameraHeight
-            k = (self.camera_height_mm - height_mm) / self.camera_height_mm
+            # PARALLAX CORRECTION LOGIC:
+            # We see the point on the TOP of the object (floor_mm).
+            # We want to find the point on the BASE of the object (corrected_mm).
+            # The base is further from the optical center than the top appears.
+            # Scale factor = CameraHeight / (CameraHeight - ObjectHeight)
+            # Ensure we don't divide by zero if material height >= camera height
+            denom = self.camera_height_mm - height_mm
+            if denom <= 0:
+                logger.warning("Material height exceeds or equals camera height; skipping parallax correction.")
+                return floor_mm
+                
+            k = self.camera_height_mm / denom
             
-            # Apply scaling in physical space
+            # Apply scaling AWAY from the optical center
             corrected_mm = floor_mm.copy()
             corrected_mm[:, 0] = opt_mm[0] + (floor_mm[:, 0] - opt_mm[0]) * k
             corrected_mm[:, 1] = opt_mm[1] + (floor_mm[:, 1] - opt_mm[1]) * k

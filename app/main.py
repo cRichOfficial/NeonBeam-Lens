@@ -15,10 +15,7 @@ from .services.mdns_advertiser import MdnsAdvertiser
 from .services.camera import camera_service
 from .services.calibration import (
     calibration_service, AprilTagGenerator, CheckerboardGenerator,
-    LensCalibrationSession,
-)
 from .services.inference import inference_service
-from .services.transform import transform_service
 
 # Robust Debug Logging
 logging.basicConfig(
@@ -72,17 +69,9 @@ class CalibrationPoint(BaseModel):
 class CalibrationRequest(BaseModel):
     tags: List[CalibrationPoint]
 
-class CorrectionRequest(BaseModel):
+class ParallaxRequest(BaseModel):
     workpiece: Dict[str, Any]
     material_height_mm: float
-
-class TransformRequest(BaseModel):
-    workpiece: Dict[str, Any]
-    material_height_mm: float = 0.0
-    design_width_mm: Optional[float] = None
-    design_height_mm: Optional[float] = None
-    dpi: Optional[float] = None
-    padding_mm: float = 5.0
 
 # Endpoints
 @app.get("/api/health")
@@ -335,59 +324,52 @@ async def get_calibration_tags():
     # Return the raw physical_data from the stored calibration
     return {"tags": status["calibration_data"].get("physical_data", [])}
 
-@app.post("/api/lens/transform")
-async def calculate_transform(request: TransformRequest):
+@app.post("/api/lens/correct-parallax")
+async def correct_parallax(request: ParallaxRequest):
     """
-    Calculate transformation parameters using provided workpiece data.
-    If material_height_mm > 0, performs parallax compensation.
+    Returns parallax-corrected geometry for a workpiece.
+    Accounts for camera mounting height and material thickness to find
+    the physical base coordinates on the bed.
     """
     wp = request.workpiece
+    height = request.material_height_mm
     
-    # 1. Capture current frame for debug image (optional but helpful)
-    frame = camera_service.get_frame()
-
-    # 2. Prepare design data
-    design_data = {}
-    if request.design_width_mm and request.design_height_mm:
-        design_data = {"width_mm": request.design_width_mm, "height_mm": request.design_height_mm}
-    elif request.dpi:
-        # Note: In this JSON-only version, we assume dimensions or previous upload
-        design_data = {"dpi": request.dpi}
-    else:
-        # If no design dims, we'll just calculate workpiece correction
-        design_data = {"width_mm": 10.0, "height_mm": 10.0} 
-
-    # 3. Calculate transform
-    result = transform_service.calculate_transform(
-        design_data, wp, request.padding_mm, 
-        material_height_mm=request.material_height_mm,
-        debug_frame=frame
-    )
-    return result
-
-@app.post("/api/lens/correct-workpiece")
-async def correct_workpiece(request: CorrectionRequest):
-    """
-    Returns only the parallax-corrected geometry for a workpiece.
-    Useful for updating the UI representation without calculating a full transform.
-    """
-    frame = camera_service.get_frame()
+    # 1. Correct corners
+    corners_px = np.array(wp["corners_px"], dtype=np.float32)
+    corners_mm = calibration_service.map_pixels_to_mm(corners_px, height_mm=height)
     
-    # We use a dummy design size since we only care about the corrected workpiece data
-    dummy_design = {"width_mm": 10.0, "height_mm": 10.0}
-    result = transform_service.calculate_transform(
-        dummy_design, request.workpiece, 0.0,
-        material_height_mm=request.material_height_mm,
-        debug_frame=frame
-    )
-    return {"workpiece": result["workpiece"]}
+    # 2. Correct segmentation
+    seg_px = np.array(wp["segmentation_px"], dtype=np.float32)
+    seg_mm = calibration_service.map_pixels_to_mm(seg_px, height_mm=height)
+    
+    # 3. Build corrected workpiece object
+    corrected_wp = wp.copy()
+    corrected_wp["corners_mm"] = corners_mm.tolist()
+    corrected_wp["segmentation_mm"] = seg_mm.tolist()
+    corrected_wp["box_mm"] = [
+        float(corners_mm[:, 0].min()),
+        float(corners_mm[:, 1].min()),
+        float(corners_mm[:, 0].max()),
+        float(corners_mm[:, 1].max()),
+    ]
+    
+    # 4. Save debug image
+    frame = camera_service.get_frame()
+    debug_img = frame.copy()
+    cv2.polylines(debug_img, [np.array(wp["corners_px"], dtype=np.int32)], True, (255, 255, 0), 2)
+    
+    debug_path = "calibration_data/parallax_debug.jpg"
+    os.makedirs(os.path.dirname(debug_path), exist_ok=True)
+    cv2.imwrite(debug_path, debug_img)
+    
+    return {"workpiece": corrected_wp}
 
-@app.get("/api/lens/transform/debug-image")
-async def get_transform_debug_image():
-    """Returns the visual debug image from the last transform calculation."""
-    debug_path = "calibration_data/transform_debug.jpg"
+@app.get("/api/lens/correct-parallax/debug-image")
+async def get_parallax_debug_image():
+    """Returns the visual debug image from the last parallax correction."""
+    debug_path = "calibration_data/parallax_debug.jpg"
     if not os.path.exists(debug_path):
-        raise HTTPException(status_code=404, detail="Transform debug image not found. Run /api/lens/transform first.")
+        raise HTTPException(status_code=404, detail="Parallax debug image not found.")
     return FileResponse(debug_path, media_type="image/jpeg")
 
 @app.get("/api/lens/stream")
