@@ -303,43 +303,30 @@ class CalibrationService:
         proc_pts_px = points_px.copy()
         
         if height_mm > 0 and self.lens_calibrated and self.camera_height_mm > 0:
-            # Normalized camera coordinates (u, v) where z=1
-            # points_px are undistorted, so we can use the camera matrix directly.
-            pts_norm = cv2.undistortPoints(
-                points_px.reshape(-1, 1, 2), 
-                self.camera_matrix, 
-                None 
-            ).reshape(-1, 2)
+            # We must use the 'optimal' camera matrix for the undistorted frame
+            # if we are processing points from an undistorted image.
+            # For simplicity, we assume the camera matrix is already scaled or 
+            # we derive the scale factor k based on the physical pinhole model.
             
-            # Intersection logic:
-            # Ray: P(t) = t * [u, v, 1]
-            # Height of camera: H (self.camera_height_mm)
-            # Height of object: h (height_mm)
-            # Distance from camera to bed: H
-            # Distance from camera to object top: H - h
+            # The top of an object at height 'h' appears further from the center
+            # than its base at the bed level.
+            # To find the base, we pull the point TOWARD the optical center.
+            # Factor k = (CameraHeight - ObjectHeight) / CameraHeight
+            k = (self.camera_height_mm - height_mm) / self.camera_height_mm
             
-            # The pixel we see (u, v) comes from the object top at z = H - h.
-            # The physical point is at [u*(H-h), v*(H-h), H-h] in camera space.
-            # We want to find where a ray from the camera through this point
-            # hits the bed (z = H).
-            # But wait! The camera *is* at z=0 in its own space. The bed is at z=H.
-            # The object top is at z = H - h.
-            
-            # Scale the normalized coordinates to find the "floor-equivalent" pixels.
-            # floor_u = u * (H / (H - h))
-            # floor_v = v * (H / (H - h))
-            k = self.camera_height_mm / (self.camera_height_mm - height_mm)
-            
-            # Back-project to pixels on the Z=0 plane
+            # Use the principal point and focal length from the matrix
             fx = self.camera_matrix[0, 0]
             fy = self.camera_matrix[1, 1]
             cx = self.camera_matrix[0, 2]
             cy = self.camera_matrix[1, 2]
             
-            proc_pts_px[:, 0] = (pts_norm[:, 0] * k) * fx + cx
-            proc_pts_px[:, 1] = (pts_norm[:, 1] * k) * fy + cy
+            # Pull pixels toward the principal point in pixel space
+            # This is equivalent to the 3D ray projection but simpler to compute
+            # when the points are already in the undistorted pinhole frame.
+            proc_pts_px[:, 0] = cx + (points_px[:, 0] - cx) * k
+            proc_pts_px[:, 1] = cy + (points_px[:, 1] - cy) * k
             
-            logger.debug(f"Parallax 3D: height={height_mm}, k={k:.4f}")
+            logger.debug(f"Parallax Correct: h={height_mm}, k={k:.4f}, cx={cx}")
 
         # 2. Standard Homography Mapping
         pts = proc_pts_px.reshape(-1, 1, 2).astype(np.float32)
