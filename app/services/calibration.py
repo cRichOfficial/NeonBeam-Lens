@@ -49,6 +49,20 @@ class CalibrationService:
         self.load_calibration()
         self._load_lens_calibration()
         
+        # Pre-calculate the optimal camera matrix for the current workspace resolution
+        # This ensures parallax math has the correct focal length from the start.
+        if self.lens_calibrated and self.workspace_width_mm > 0:
+            # We use a default/last known resolution or a standard one
+            w, h = 1920, 1080 # Default if not yet known
+            if self.is_fisheye:
+                self._undistorted_camera_matrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                    self.camera_matrix, self.dist_coeffs, (w, h), np.eye(3), balance=1.0
+                )
+            else:
+                self._undistorted_camera_matrix, _ = cv2.getOptimalNewCameraMatrix(
+                    self.camera_matrix, self.dist_coeffs, (w, h), 1.0
+                )
+        
         # AprilTag setup (using Aruco module)
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         self.aruco_params = cv2.aruco.DetectorParameters()
@@ -92,6 +106,13 @@ class CalibrationService:
                     data = json.load(f)
                     self.homography_matrix = np.array(data['matrix'])
                     self.calibration_data = data.get('calibration_data', None)
+                    
+                    # Auto-load derived camera height if available
+                    if self.calibration_data:
+                        derived_h = self.calibration_data.get('derived_camera_height_mm')
+                        if derived_h and derived_h > 0:
+                            self.camera_height_mm = derived_h
+                            logger.info(f"Using derived camera height: {self.camera_height_mm:.2f}mm")
                 logger.info(f"Loaded homography from {self.data_path}")
             except Exception as e:
                 logger.error(f"Failed to load homography: {e}")
@@ -236,11 +257,33 @@ class CalibrationService:
         matrix, status = cv2.findHomography(src_pts, dst_pts, 0)
         
         if matrix is not None:
+            # --- AUTO-HEIGHT DERIVATION (solvePnP) ---
+            derived_height = 0.0
+            if self.lens_calibrated:
+                obj_pts_3d = np.zeros((len(dst_pts), 3), dtype=np.float32)
+                obj_pts_3d[:, :2] = dst_pts
+                k_matrix = getattr(self, "_undistorted_camera_matrix", self.camera_matrix)
+                
+                success, rvec, tvec = cv2.solvePnP(
+                    obj_pts_3d, src_pts, k_matrix, None, flags=cv2.SOLVEPNP_ITERATIVE
+                )
+                if success:
+                    R, _ = cv2.Rodrigues(rvec)
+                    cam_pos = -R.T @ tvec
+                    derived_height = abs(float(cam_pos[2]))
+                    logger.info(f"Derived camera height from calibration: {derived_height:.2f}mm")
+            
             calib_data = {
                 "detected_tags": detected_tags,
-                "physical_data": physical_data
+                "physical_data": physical_data,
+                "derived_camera_height_mm": derived_height
             }
             self.save_calibration(matrix, calib_data)
+            
+            # Immediately apply to current session
+            if derived_height > 0:
+                self.camera_height_mm = derived_height
+                
             return matrix
         return None
 
