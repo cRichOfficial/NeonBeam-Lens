@@ -21,12 +21,13 @@ class CalibrationService:
         self.calibration_data = None
 
         # Lens distortion model: standard pinhole or fisheye (Kannala-Brandt)
-        self.is_fisheye = os.getenv("FISHEYE_LENS", "False").lower() == "true"
+        self.is_fisheye = os.getenv("FISHEYE_LENS", "true").lower() == "true"
 
         # Lens intrinsics — loaded from lens_calibration.json if available
         self.camera_matrix = None   # K (3×3)
         self.dist_coeffs = None     # D (standard: 5 or 8 coeffs, fisheye: 4)
         self.lens_calibrated = False
+        self.camera_matrix_size = (640, 480) # Default
 
         # Cached undistort remap tables (computed once, applied via cv2.remap)
         self._undistort_map1 = None
@@ -127,6 +128,7 @@ class CalibrationService:
                 data = json.load(f)
             self.camera_matrix = np.array(data['camera_matrix'], dtype=np.float64)
             self.dist_coeffs = np.array(data['dist_coeffs'], dtype=np.float64)
+            self.camera_matrix_size = tuple(data.get('image_size', (640, 480)))
             self.lens_calibrated = True
             stored_model = data.get('model', 'standard')
             logger.info(
@@ -272,14 +274,30 @@ class CalibrationService:
             derived_height = 0.0
             if self.lens_calibrated and len(src_pts) >= 4:
                 try:
-                    # solvePnP prefers (N, 1, 2) and (N, 1, 3) float32 arrays
+                    # Get the detection resolution
+                    w = int(max(p[0] for p in src_pts))
+                    h = int(max(p[1] for p in src_pts))
+                    w = max(w, 640); h = max(h, 480) # Safety
+                    
+                    # Use the optimal undistorted matrix
+                    matrix = getattr(self, "_undistorted_camera_matrix", self.camera_matrix).copy()
+                    
+                    # SCALE THE MATRIX: 
+                    # If the matrix was calibrated at resolution (cw, ch) but we are 
+                    # running at (w, h), we must scale fx, fy, cx, cy.
+                    # We use the resolution the undistort maps were built for.
+                    if self._undistort_resolution:
+                        uw, uh = self._undistort_resolution
+                        sw = uw / self.camera_matrix_size[0]
+                        sh = uh / self.camera_matrix_size[1]
+                        matrix[0, 0] *= sw; matrix[0, 2] *= sw # fx, cx
+                        matrix[1, 1] *= sh; matrix[1, 2] *= sh # fy, cy
+                    
                     op3d = np.array(obj_pts_3d, dtype=np.float32).reshape(-1, 1, 3)
                     ip2d = np.array(src_pts, dtype=np.float32).reshape(-1, 1, 2)
                     
-                    k_matrix = getattr(self, "_undistorted_camera_matrix", self.camera_matrix)
-                    
                     success, rvec, tvec = cv2.solvePnP(
-                        op3d, ip2d, k_matrix, None, flags=cv2.SOLVEPNP_ITERATIVE
+                        op3d, ip2d, matrix, None, flags=cv2.SOLVEPNP_ITERATIVE
                     )
                     if success:
                         R, _ = cv2.Rodrigues(rvec)
