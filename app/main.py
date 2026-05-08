@@ -339,7 +339,14 @@ async def correct_parallax(request: ParallaxRequest):
     
     # 1. Correct corners
     corners_px = np.array(wp["corners_px"], dtype=np.float32)
+    corners_mm_raw = np.array(wp["corners_mm"], dtype=np.float32)
+    
+    # Log the state before correction
+    logger.debug(f"Parallax correction: height={height}mm, camera_h={calibration_service.camera_height_mm}mm")
+    
     corners_mm = calibration_service.map_pixels_to_mm(corners_px, height_mm=height)
+    
+    logger.debug(f"Corners: Raw_MM[0]={corners_mm_raw[0]}, Corrected_MM[0]={corners_mm[0]}")
     
     # 2. Correct segmentation
     seg_px = np.array(wp["segmentation_px"], dtype=np.float32)

@@ -329,6 +329,7 @@ class CalibrationService:
             k = self.camera_height_mm / denom
             
             # Apply scaling AWAY from the optical center
+            logger.debug(f"Parallax math: opt_mm={opt_mm}, k={k:.4f}")
             corrected_mm = floor_mm.copy()
             corrected_mm[:, 0] = opt_mm[0] + (floor_mm[:, 0] - opt_mm[0]) * k
             corrected_mm[:, 1] = opt_mm[1] + (floor_mm[:, 1] - opt_mm[1]) * k
