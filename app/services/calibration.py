@@ -290,8 +290,13 @@ class CalibrationService:
                         uw, uh = self._undistort_resolution
                         sw = uw / self.camera_matrix_size[0]
                         sh = uh / self.camera_matrix_size[1]
+                        logger.debug(f"Pose Scale: res={uw}x{uh}, cal={self.camera_matrix_size}, sw={sw:.2f}, sh={sh:.2f}")
+                        logger.debug(f"Focal prev: fx={matrix[0,0]:.1f}, fy={matrix[1,1]:.1f}")
                         matrix[0, 0] *= sw; matrix[0, 2] *= sw # fx, cx
                         matrix[1, 1] *= sh; matrix[1, 2] *= sh # fy, cy
+                        logger.debug(f"Focal now:  fx={matrix[0,0]:.1f}, fy={matrix[1,1]:.1f}")
+                    else:
+                        logger.warning("No _undistort_resolution found; height will be inaccurate.")
                     
                     op3d = np.array(obj_pts_3d, dtype=np.float32).reshape(-1, 1, 3)
                     ip2d = np.array(src_pts, dtype=np.float32).reshape(-1, 1, 2)
